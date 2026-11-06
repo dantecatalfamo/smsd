@@ -1,0 +1,5 @@
+/smsd
+*.db
+*.db-wal
+*.db-shm
+/media/
