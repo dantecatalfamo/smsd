@@ -22,27 +22,29 @@ var safeName = regexp.MustCompile(`^[A-Za-z0-9_-]+(\.[A-Za-z0-9]+)?$`)
 var mediaExt = map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "video/mp4": ".mp4"}
 
 // saveMedia downloads an inbound message's media into MediaDir so it outlives
-// the provider's URLs, then records the local file names on the message.
+// SignalWire's URLs, recording each local file name as it lands.
 func (s *server) saveMedia(ctx context.Context, m Message) {
-	var files []string
-	for i, u := range m.Media {
-		name, err := s.downloadMedia(ctx, u, fmt.Sprintf("%s-%d", m.SID, i))
-		if err != nil {
-			log.Printf("media %s[%d]: %v", m.SID, i, err)
+	for i, md := range m.Media {
+		if md.URL == "" {
 			continue
 		}
-		files = append(files, name)
-	}
-	if len(files) == 0 {
-		return
-	}
-	if err := s.store.SetMediaFiles(ctx, m.ID, files); err != nil {
-		log.Printf("store media files for %s: %v", m.SID, err)
+		if md.Size > maxMediaBytes {
+			log.Printf("media %s[%d]: skipping, SignalWire reports %d bytes (limit %d)", m.SignalWireID, i, md.Size, maxMediaBytes)
+			continue
+		}
+		name, err := s.downloadMedia(ctx, md, fmt.Sprintf("%s-%d", m.SignalWireID, i))
+		if err != nil {
+			log.Printf("media %s[%d]: %v", m.SignalWireID, i, err)
+			continue
+		}
+		if err := s.store.SetMediaFile(ctx, m.ID, i, name); err != nil {
+			log.Printf("store media file for %s[%d]: %v", m.SignalWireID, i, err)
+		}
 	}
 }
 
-func (s *server) downloadMedia(ctx context.Context, rawURL, base string) (string, error) {
-	resp, err := s.sw.Fetch(ctx, rawURL)
+func (s *server) downloadMedia(ctx context.Context, md Media, base string) (string, error) {
+	resp, err := s.sw.Fetch(ctx, md.URL)
 	if err != nil {
 		return "", err
 	}
@@ -51,13 +53,16 @@ func (s *server) downloadMedia(ctx context.Context, rawURL, base string) (string
 		return "", fmt.Errorf("fetch: status %d", resp.StatusCode)
 	}
 
+	// Trust the download's own type first; fall back to what the webhook declared.
+	ct, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil || ct == "application/octet-stream" {
+		ct, _, _ = mime.ParseMediaType(md.ContentType)
+	}
 	ext := ""
-	if ct, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type")); err == nil {
-		if e, ok := mediaExt[ct]; ok {
-			ext = e
-		} else if exts, _ := mime.ExtensionsByType(ct); len(exts) > 0 {
-			ext = exts[0]
-		}
+	if e, ok := mediaExt[ct]; ok {
+		ext = e
+	} else if exts, _ := mime.ExtensionsByType(ct); len(exts) > 0 {
+		ext = exts[0]
 	}
 	name := base + ext
 	if !safeName.MatchString(name) {

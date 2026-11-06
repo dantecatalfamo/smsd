@@ -24,7 +24,13 @@ type Notifier interface {
 
 type logNotifier struct{}
 
-func (logNotifier) Inbound(m Message) { log.Printf("inbound from %s: %q", m.Peer, m.Body) }
+func (logNotifier) Inbound(m Message) {
+	body := ""
+	if m.Body != nil {
+		body = *m.Body
+	}
+	log.Printf("inbound from %s: %q (%d media)", m.Peer, body, len(m.Media))
+}
 
 type server struct {
 	cfg      config
@@ -77,24 +83,28 @@ func (s *server) verifySignalWire(next http.Handler) http.Handler {
 }
 
 // inboundPayload is what SignalWire POSTs to a SWML messaging webhook.
+// params and vars are only filled in on transfer/execute fetches, which smsd
+// never triggers; they are still kept in the stored raw payload.
 type inboundPayload struct {
 	Message struct {
 		MessageID string  `json:"message_id"`
+		ProjectID string  `json:"project_id"`
+		SpaceID   string  `json:"space_id"`
+		Direction string  `json:"direction"`
+		Type      string  `json:"type"`
 		From      string  `json:"from"`
 		To        string  `json:"to"`
-		Body      *string `json:"body"` // null on media-only MMS
-		Media     []struct {
-			URL         string `json:"url"`
-			ContentType string `json:"content_type"`
-			Size        int64  `json:"size"`
-		} `json:"media"`
-		Timestamp string `json:"timestamp"`
+		Body      *string `json:"body"`
+		Media     []Media `json:"media"`
+		Segments  *int    `json:"segments"`
+		Timestamp string  `json:"timestamp"`
 	} `json:"message"`
 }
 
 func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
+	raw, _ := io.ReadAll(r.Body) // already read and bounded by verifySignalWire
 	var p inboundPayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := json.Unmarshal(raw, &p); err != nil {
 		http.Error(w, "bad JSON", http.StatusBadRequest)
 		return
 	}
@@ -104,6 +114,9 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing message_id", http.StatusBadRequest)
 		return
 	}
+	if in.Direction != "" && in.Direction != string(Inbound) {
+		log.Printf("inbound webhook %s with direction %q", in.MessageID, in.Direction)
+	}
 	if in.To != s.cfg.FromNumber {
 		// Signed by our project, but for another number. Accept so it isn't retried.
 		log.Printf("ignoring inbound for %s (we are %s)", in.To, s.cfg.FromNumber)
@@ -112,25 +125,23 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := Message{
-		SID:       in.MessageID,
-		Direction: Inbound,
-		Peer:      in.From,
-		Status:    "received",
-		CreatedAt: time.Now().UTC(),
+		SignalWireID: in.MessageID,
+		ProjectID:    in.ProjectID,
+		SpaceID:      in.SpaceID,
+		Direction:    Inbound,
+		Type:         in.Type,
+		From:         in.From,
+		To:           in.To,
+		Body:         in.Body,
+		Segments:     in.Segments,
+		Media:        in.Media,
+		Status:       "received",
+		Timestamp:    parseTime(in.Timestamp, "timestamp of "+in.MessageID),
+		CreatedAt:    time.Now().UTC(),
+		Raw:          raw,
 	}
-	if in.Body != nil {
-		m.Body = *in.Body
-	}
-	if t, err := time.Parse(time.RFC3339, in.Timestamp); err == nil {
-		m.CreatedAt = t.UTC()
-	}
-	for i, md := range in.Media {
-		if i == 10 {
-			break
-		}
-		if md.URL != "" {
-			m.Media = append(m.Media, md.URL)
-		}
+	for i := range m.Media {
+		m.Media[i].File = "" // ours to set, never SignalWire's
 	}
 
 	inserted, err := s.store.Insert(r.Context(), &m)
@@ -166,10 +177,11 @@ func writeReceive(w http.ResponseWriter) {
 
 // statusPayload is what SignalWire POSTs to an outbound message's status_callback.
 type statusPayload struct {
-	ID           string  `json:"id"`
-	Status       string  `json:"status"`
-	ErrorCode    any     `json:"error_code"` // provider-specific; not always a string
-	ErrorMessage *string `json:"error_message"`
+	ID           string          `json:"id"`
+	Status       string          `json:"status"`
+	ErrorCode    json.RawMessage `json:"error_code"` // provider-specific; not always a string
+	ErrorMessage *string         `json:"error_message"`
+	Timestamp    string          `json:"timestamp"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -183,15 +195,49 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if p.ErrorMessage != nil {
-		log.Printf("message %s %s: %v %s", p.ID, p.Status, p.ErrorCode, *p.ErrorMessage)
+	u := StatusUpdate{
+		SignalWireID: p.ID,
+		Status:       p.Status,
+		ErrorCode:    errorCode(p.ErrorCode),
+		ErrorMessage: p.ErrorMessage,
+		At:           parseTime(p.Timestamp, "status timestamp of "+p.ID),
 	}
-	if err := s.store.UpdateStatus(r.Context(), p.ID, p.Status); err != nil {
+	if u.ErrorMessage != nil {
+		log.Printf("message %s %s: %v %s", p.ID, p.Status, string(p.ErrorCode), *u.ErrorMessage)
+	}
+	if err := s.store.UpdateStatus(r.Context(), u); err != nil {
 		log.Printf("update status: %v", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// parseTime parses a SignalWire timestamp; empty or unparseable gives nil
+// (logged, rather than silently replaced with our clock).
+func parseTime(v, what string) *time.Time {
+	if v == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		log.Printf("unparseable %s: %q", what, v)
+		return nil
+	}
+	t = t.UTC()
+	return &t
+}
+
+// errorCode turns a JSON error_code of any type into text; null gives nil.
+func errorCode(raw json.RawMessage) *string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		s = string(raw)
+	}
+	return &s
 }
 
 // --- API --------------------------------------------------------------------
@@ -268,12 +314,20 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := Message{
-		SID:       res.ID,
-		Direction: Outbound,
-		Peer:      peer,
-		Body:      req.Body,
-		Status:    res.Status,
-		CreatedAt: time.Now().UTC(),
+		SignalWireID: res.ID,
+		ProjectID:    res.ProjectID,
+		Direction:    Outbound,
+		Type:         res.Kind,
+		From:         s.cfg.FromNumber,
+		To:           peer,
+		Body:         &req.Body,
+		Segments:     res.NumberOfSegments,
+		Status:       res.Status,
+		ErrorCode:    errorCode(res.ErrorCode),
+		ErrorMessage: res.ErrorMessage,
+		Timestamp:    parseTime(res.CreatedAt, "created_at of "+res.ID),
+		CreatedAt:    time.Now().UTC(),
+		Raw:          res.Raw,
 	}
 	if _, err := s.store.Insert(r.Context(), &m); err != nil {
 		// The SMS went out; we just failed to record it. Report that honestly.

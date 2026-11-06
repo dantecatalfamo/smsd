@@ -36,9 +36,18 @@ func newSignalWire(space, projectID, apiToken string) *signalWire {
 	}
 }
 
+// sendResult is the create-message response.
 type sendResult struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
+	ID               string          `json:"id"`
+	ProjectID        string          `json:"project_id"`
+	Status           string          `json:"status"`
+	Kind             string          `json:"kind"` // sms, mms, whatsapp
+	NumberOfSegments *int            `json:"number_of_segments"`
+	ErrorCode        json.RawMessage `json:"error_code"`
+	ErrorMessage     *string         `json:"error_message"`
+	CreatedAt        string          `json:"created_at"`
+
+	Raw json.RawMessage `json:"-"` // the whole response, stored with the message
 }
 
 type apiError struct {
@@ -114,6 +123,7 @@ func (c *signalWire) Send(ctx context.Context, from, to, body, statusCallback st
 	if out.ID == "" {
 		return nil, fmt.Errorf("send response has no message id: %s", raw)
 	}
+	out.Raw = raw
 	return &out, nil
 }
 

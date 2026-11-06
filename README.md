@@ -52,13 +52,15 @@ curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/conversations/%2B1613
 curl -H "Authorization: Bearer $APP_TOKEN" -d '{"body":"hey!"}' \
   $PUBLIC_URL/api/conversations/%2B16135551234/messages
 
-# fetch a saved MMS attachment (names come from a message's media_files)
-curl -H "Authorization: Bearer $APP_TOKEN" -O $PUBLIC_URL/api/media/SMxxxx-0.jpg
+# fetch a saved MMS attachment (the name is a media item's "file")
+curl -H "Authorization: Bearer $APP_TOKEN" -O $PUBLIC_URL/api/media/<signalwire_id>-0.jpg
 ```
 
-Inbound MMS media is downloaded in the background (up to 25 MB per file) so it outlives SignalWire's URLs. `media` keeps the original URLs; `media_files` fills in once the downloads finish.
+Messages carry every field SignalWire sends: `signalwire_id`, `project_id`, `space_id`, `direction` (`inbound`/`outbound`), `type` (`sms`/`mms`), `from`, `to`, `body` (null on media-only MMS), `segments`, `timestamp` (SignalWire's time) and `media`. smsd adds `peer` (the other party, which conversations are keyed on), `status`, `error_code`/`error_message`/`status_at` from the latest status callback, and `created_at` (when smsd stored it). The exact payload SignalWire sent is also kept in the database's `raw` column.
 
-Replies go out through SignalWire's messaging REST API (`POST /api/messaging/messages`). Delivery status updates arrive at `POST /webhook/status` and are written to the message's `status` field. A callback that arrives before its message is stored is held and applied when the message is stored.
+Each `media` item has `url`, `content_type` and `size` as SignalWire reported them. Attachments are downloaded in the background (up to 25 MB each) so they outlive SignalWire's URLs, and `file` fills in once the download finishes.
+
+Replies go out through SignalWire's messaging REST API (`POST /api/messaging/messages`). Delivery status updates arrive at `POST /webhook/status` and update the message's `status`, `error_code`, `error_message` and `status_at`. A callback that arrives before its message is stored is held and applied when the message is stored.
 
 ## Extending
 
