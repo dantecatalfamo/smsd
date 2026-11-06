@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,7 @@ type server struct {
 	store    *Store
 	sw       *signalWire
 	notifier Notifier
+	events   *broker
 	mediaKey []byte // signs /media-out/ links
 
 	// Background work (notifier calls, media downloads) runs under ctx, which
@@ -61,7 +63,7 @@ func newServer(cfg config, store *Store, sw *signalWire, notifier Notifier) *ser
 	// Derived from APP_TOKEN so links stay valid across restarts; rotating the token revokes them.
 	mac := hmac.New(sha256.New, []byte(cfg.AppToken))
 	mac.Write([]byte("smsd media-out v1"))
-	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, mediaKey: mac.Sum(nil), ctx: ctx, cancel: cancel}
+	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, events: newBroker(), mediaKey: mac.Sum(nil), ctx: ctx, cancel: cancel}
 }
 
 // background runs f in a goroutine unless the server is stopping. A panic is
@@ -84,8 +86,9 @@ func (s *server) background(f func(ctx context.Context)) {
 	}()
 }
 
-// stop cancels background work and waits for it to finish.
+// stop ends event streams, cancels background work and waits for it to finish.
 func (s *server) stop() {
+	s.events.close()
 	s.mu.Lock()
 	s.cancel()
 	s.mu.Unlock()
@@ -102,6 +105,9 @@ func (s *server) routes() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/numbers", s.handleNumbers)
 	api.HandleFunc("GET /api/conversations", s.handleConversations)
+	api.HandleFunc("GET /api/events", s.handleEvents)
+	api.HandleFunc("GET /api/numbers/{number}/events", s.handleEvents)
+	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}/events", s.handleEvents)
 	api.HandleFunc("GET /api/numbers/{number}/conversations", s.handleConversations)
 	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}", s.handleMessages)
 	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/messages", s.handleSend)
@@ -216,6 +222,7 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if inserted {
+		s.events.publish(eventMessage, m)
 		s.background(func(context.Context) { s.notifier.Inbound(m) })
 		if len(m.Media) > 0 {
 			jobs := make([]mediaJob, len(m.Media))
@@ -277,6 +284,8 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	// A callback that beats its message is applied by Insert and goes out with it.
+	s.publishUpdate(s.store.MessageBySignalWireID(r.Context(), p.ID))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -562,10 +571,23 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errBody("sent but not stored: "+res.ID))
 		return
 	}
+	s.events.publish(eventMessage, m)
 	writeJSON(w, http.StatusCreated, m)
 }
 
 // --- helpers ----------------------------------------------------------------
+
+// publishUpdate sends a changed message to event streams; it takes a store
+// lookup's results directly. A message that isn't stored yet is skipped.
+func (s *server) publishUpdate(m Message, err error) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		log.Printf("load message for update event: %v", err)
+	default:
+		s.events.publish(eventUpdate, m)
+	}
+}
 
 // addrPattern accepts E.164 numbers, short codes and alphanumeric sender IDs,
 // for both our numbers and peers. Sends from a number the project doesn't

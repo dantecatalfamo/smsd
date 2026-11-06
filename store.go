@@ -365,18 +365,58 @@ func (s *Store) Conversations(ctx context.Context, number string) ([]Conversatio
 	return out, rows.Err()
 }
 
-// Messages returns the conversation between number and peer oldest-first. If beforeID > 0, only
-// messages older than it are returned (for paging back through history).
+// Messages returns the conversation between number and peer oldest-first.
+// If beforeID > 0, only messages older than it are returned (for paging back
+// through history).
 func (s *Store) Messages(ctx context.Context, number, peer string, beforeID int64, limit int) ([]Message, error) {
 	if beforeID <= 0 {
 		beforeID = 1<<63 - 1
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, signalwire_id, COALESCE(project_id, ''), COALESCE(space_id, ''), direction, COALESCE(type, ''),
-			from_number, to_number, local_number, peer, body, segments, status, error_code, error_message,
-			timestamp, status_at, created_at, raw
+	return s.queryMessages(ctx, `
+		SELECT `+messageCols+`
 		FROM (SELECT * FROM messages WHERE local_number = ? AND peer = ? AND id < ? ORDER BY id DESC LIMIT ?)
 		ORDER BY id ASC`, number, peer, beforeID, limit)
+}
+
+// MessagesAfter returns up to limit messages newer than afterID, oldest first,
+// on one of our numbers (or all, if number is empty) and with one peer (or
+// all, if peer is empty).
+func (s *Store) MessagesAfter(ctx context.Context, number, peer string, afterID int64, limit int) ([]Message, error) {
+	return s.queryMessages(ctx, `
+		SELECT `+messageCols+` FROM messages
+		WHERE id > ?1 AND (?2 = '' OR local_number = ?2) AND (?3 = '' OR peer = ?3)
+		ORDER BY id ASC LIMIT ?4`, afterID, number, peer, limit)
+}
+
+// MessageBySignalWireID returns one message, or sql.ErrNoRows.
+func (s *Store) MessageBySignalWireID(ctx context.Context, id string) (Message, error) {
+	return oneMessage(s.queryMessages(ctx, `SELECT `+messageCols+` FROM messages WHERE signalwire_id = ?`, id))
+}
+
+// MessageByID returns one message, or sql.ErrNoRows.
+func (s *Store) MessageByID(ctx context.Context, id int64) (Message, error) {
+	return oneMessage(s.queryMessages(ctx, `SELECT `+messageCols+` FROM messages WHERE id = ?`, id))
+}
+
+func oneMessage(msgs []Message, err error) (Message, error) {
+	if err == nil && len(msgs) == 0 {
+		err = sql.ErrNoRows
+	}
+	if err != nil {
+		return Message{}, err
+	}
+	return msgs[0], nil
+}
+
+// messageCols are the columns queryMessages scans, in order.
+const messageCols = `id, signalwire_id, COALESCE(project_id, ''), COALESCE(space_id, ''), direction, COALESCE(type, ''),
+	from_number, to_number, local_number, peer, body, segments, status, error_code, error_message,
+	timestamp, status_at, created_at, raw`
+
+// queryMessages runs a query selecting messageCols in ascending id order and
+// attaches each message's media.
+func (s *Store) queryMessages(ctx context.Context, query string, args ...any) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +446,7 @@ func (s *Store) Messages(ctx context.Context, number, peer string, beforeID int6
 		return out, err
 	}
 
-	// The page's id range also covers other conversations' messages; byID keeps only this page's.
+	// The id range can also cover messages that weren't selected; byID keeps only ours.
 	mrows, err := s.db.QueryContext(ctx, `
 		SELECT message_id, url, COALESCE(content_type, ''), COALESCE(size, 0), COALESCE(file, ''), COALESCE(served_type, '')
 		FROM media WHERE message_id BETWEEN ? AND ?

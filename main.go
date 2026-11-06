@@ -137,6 +137,8 @@ func main() {
 		WriteTimeout:      30 * time.Second, // /api/media extends its own deadline
 		IdleTimeout:       120 * time.Second,
 	}
+	// Shutdown waits for connections to go idle, which event streams never do.
+	httpSrv.RegisterOnShutdown(srv.events.close)
 
 	go func() {
 		log.Printf("listening on %s", cfg.Addr)

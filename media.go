@@ -71,7 +71,9 @@ func (s *server) saveMedia(ctx context.Context, jobs []mediaJob) {
 		}
 		if err := s.downloadMedia(ctx, j); err != nil {
 			log.Printf("media %d[%d]: %v", j.MessageID, j.Position, err)
+			continue
 		}
+		s.publishUpdate(s.store.MessageByID(ctx, j.MessageID))
 	}
 }
 

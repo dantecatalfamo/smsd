@@ -83,6 +83,23 @@ SignalWire fetches outgoing attachments itself, from `GET /media-out/{file}` on 
 
 Delivery status callbacks arrive at `POST /webhook/status` and are all kept, raw, in the `status_events` table. A message's `status`, `error_code`, `error_message` and `status_at` come from its newest event (by SignalWire's timestamp, then how far along the status is), so callbacks that arrive out of order or before the message is stored can't overwrite a newer status.
 
+## Events
+
+Three server-sent event streams push messages as they happen: every message on every number, every message on one of your numbers, or one conversation.
+
+```sh
+curl -N -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/events
+curl -N -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/numbers/%2B16135550000/events
+curl -N -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/numbers/%2B16135550000/conversations/%2B16135551234/events
+```
+
+Each event's data is a whole message, as the API returns it:
+
+- `message`: a new message, inbound or outbound. Its SSE `id` is the message's `id`.
+- `update`: a stored message changed, after a delivery status callback or an attachment finishing its download. Updates have no `id`.
+
+Reconnect with `Last-Event-ID` (EventSource clients do this themselves) to get the messages stored since that id before live events resume. Missed updates are not replayed, so refetch the conversation if you need current statuses. A stream that falls too far behind is closed, and catches up the same way when the client reconnects. A `: ping` comment every 25 seconds keeps idle connections open through proxies. Streams need the same bearer token as the rest of the API, so the browser's built-in `EventSource`, which can't send headers, won't work; use a fetch-based client.
+
 ## Extending
 
 - **Notifications / chat bridge:** implement `Notifier` (`handlers.go`) and replace `logNotifier` in `main.go`. That's where Telegram, Matrix or ntfy plugs in. It runs in the background, so it can block without delaying SignalWire's webhook. To reply from the bridge, call `sw.Send` and `store.Insert` the same way `handleSend` does.
