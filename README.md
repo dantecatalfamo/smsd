@@ -4,7 +4,7 @@ Minimal two-way SMS backend for a SignalWire number. It does three things:
 
 - Takes inbound SMS/MMS from SignalWire's webhook, checks the signature and stores the message (MMS media is downloaded locally)
 - Groups messages into conversations by the other party's number
-- Lets you send replies through a small bearer-token JSON API
+- Lets you send replies, with or without media, through a small bearer-token API
 
 Single binary, stdlib HTTP, SQLite via `modernc.org/sqlite` (no cgo).
 
@@ -54,6 +54,14 @@ curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/conversations/%2B1613
 curl -H "Authorization: Bearer $APP_TOKEN" -d '{"body":"hey!"}' \
   $PUBLIC_URL/api/conversations/%2B16135551234/messages
 
+# reply with media: upload files (repeat -F media=@... up to 7 times)
+curl -H "Authorization: Bearer $APP_TOKEN" -F body='look' -F media=@cat.jpg \
+  $PUBLIC_URL/api/conversations/%2B16135551234/messages
+
+# forward an attachment smsd already has (a media item's "file")
+curl -H "Authorization: Bearer $APP_TOKEN" -d '{"body":"fwd","media_files":["42-0.jpg"]}' \
+  $PUBLIC_URL/api/conversations/%2B16135551234/messages
+
 # fetch a saved MMS attachment (the name is a media item's "file")
 curl -H "Authorization: Bearer $APP_TOKEN" -O $PUBLIC_URL/api/media/42-0.jpg
 ```
@@ -64,7 +72,9 @@ Each `media` item has `url`, `content_type` and `size` as SignalWire reported th
 
 `/api/media/{file}` serves only files smsd downloaded, with the type recorded at download time (`served_type`). Images, audio and video display inline; anything else (HTML, SVG, text, vCards...) is sent as a download. Every response carries `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`.
 
-Replies go out through SignalWire's messaging REST API (`POST /api/messaging/messages`). A reply is recorded even if the client disconnects mid-request. If SignalWire doesn't answer within 15s the API returns 504: the message may have gone out, so check before retrying.
+Replies go out through SignalWire's messaging REST API (`POST /api/messaging/messages`). A reply needs a body, media, or both. Media can be uploaded (`multipart/form-data` with `body`, `media` and `media_files` fields) or forwarded by file name (`media_files`, in JSON or multipart), up to 7 per message and 5 MB per request. Only [types SignalWire accepts for MMS](https://signalwire.com/docs/platform/messaging/mime-types) are allowed; a missing upload type is sniffed from the content. SignalWire delivers about 1.2 MB per MMS on local numbers and 750 KB on toll-free, so keep attachments small.
+
+SignalWire fetches outgoing attachments itself, from `GET /media-out/{file}` on `PUBLIC_URL`. That route needs no token, but serves only links smsd signed (HMAC keyed from `APP_TOKEN`, covering the file, its type and an expiry 24 hours out). Rotating `APP_TOKEN` revokes outstanding links. Uploaded files are kept in `MEDIA_DIR` like received ones and appear on the stored message's `media`. A reply is recorded even if the client disconnects mid-request. If SignalWire doesn't answer within 15s the API returns 504: the message may have gone out, so check before retrying.
 
 Delivery status callbacks arrive at `POST /webhook/status` and are all kept, raw, in the `status_events` table. A message's `status`, `error_code`, `error_message` and `status_at` come from its newest event (by SignalWire's timestamp, then how far along the status is), so callbacks that arrive out of order or before the message is stored can't overwrite a newer status.
 

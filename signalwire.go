@@ -99,16 +99,18 @@ func parseAPIError(status int, raw []byte) *apiError {
 	return &apiError{Status: status, Message: msg}
 }
 
-// Send creates an outbound SMS. statusCallback may be empty.
-func (c *signalWire) Send(ctx context.Context, from, to, body, statusCallback string) (*sendResult, error) {
+// Send creates an outbound SMS, or MMS when media URLs are given. body may be
+// empty if there is media; statusCallback may be empty.
+func (c *signalWire) Send(ctx context.Context, from, to, body string, media []string, statusCallback string) (*sendResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
 	defer cancel()
 	payload, err := json.Marshal(struct {
-		From           string `json:"from"`
-		To             string `json:"to"`
-		Body           string `json:"body"`
-		StatusCallback string `json:"status_callback,omitempty"`
-	}{from, to, body, statusCallback})
+		From           string   `json:"from"`
+		To             string   `json:"to"`
+		Body           string   `json:"body,omitempty"`
+		Media          []string `json:"media,omitempty"`
+		StatusCallback string   `json:"status_callback,omitempty"`
+	}{from, to, body, media, statusCallback})
 	if err != nil {
 		return nil, err
 	}

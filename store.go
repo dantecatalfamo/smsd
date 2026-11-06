@@ -111,10 +111,11 @@ CREATE TABLE media (
 	url          TEXT    NOT NULL,
 	content_type TEXT,
 	size         INTEGER,
-	file         TEXT    UNIQUE,
+	file         TEXT,
 	served_type  TEXT,
 	PRIMARY KEY (message_id, position)
 );
+CREATE INDEX media_file ON media(file); -- not unique: a forwarded file appears again
 
 -- Every status callback, as received. A message's status columns are derived
 -- from these (see applyStatus), so out-of-order and early callbacks are harmless.
@@ -234,8 +235,8 @@ func (s *Store) Insert(ctx context.Context, m *Message) (inserted bool, err erro
 
 	for i, md := range m.Media {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO media (message_id, position, url, content_type, size) VALUES (?, ?, ?, ?, ?)`,
-			id, i, md.URL, nullString(md.ContentType), md.Size); err != nil {
+			`INSERT INTO media (message_id, position, url, content_type, size, file, served_type) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			id, i, md.URL, nullString(md.ContentType), md.Size, nullString(md.File), nullString(md.ServedType)); err != nil {
 			return false, err
 		}
 	}
@@ -327,7 +328,7 @@ func (s *Store) SetMediaFile(ctx context.Context, messageID int64, position int,
 // sql.ErrNoRows if smsd never wrote a file by that name.
 func (s *Store) MediaServedType(ctx context.Context, file string) (string, error) {
 	var ct string
-	err := s.db.QueryRowContext(ctx, `SELECT served_type FROM media WHERE file = ?`, file).Scan(&ct)
+	err := s.db.QueryRowContext(ctx, `SELECT served_type FROM media WHERE file = ? LIMIT 1`, file).Scan(&ct)
 	return ct, err
 }
 

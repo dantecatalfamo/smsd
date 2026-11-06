@@ -1,16 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -145,17 +152,137 @@ func (s *server) handleMedia(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
 		return
 	}
+	serveMediaFile(w, r, filepath.Join(s.cfg.MediaDir, name), ct)
+}
+
+// serveMediaFile serves a media file with a fixed type. Nothing is inferred
+// from the name or the content.
+func serveMediaFile(w http.ResponseWriter, r *http.Request, path, contentType string) {
 	h := w.Header()
-	h.Set("Content-Type", ct)
+	h.Set("Content-Type", contentType)
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Security-Policy", "sandbox") // no scripts even if a type slips through
-	if !servedInline(ct) {
+	if !servedInline(contentType) {
 		h.Set("Content-Disposition", "attachment")
 	}
 	// Large files on slow links outlast the server-wide WriteTimeout.
-	err = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Minute))
+	err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(10 * time.Minute))
 	if err != nil && !errors.Is(err, http.ErrNotSupported) {
-		log.Printf("media %q: extend write deadline: %v", name, err)
+		log.Printf("media %q: extend write deadline: %v", path, err)
 	}
-	http.ServeFile(w, r, filepath.Join(s.cfg.MediaDir, name))
+	http.ServeFile(w, r, path)
+}
+
+// --- outbound media ---------------------------------------------------------
+
+const (
+	maxSendMedia     = 7       // SignalWire's limit per message
+	maxUploadBytes   = 5 << 20 // per request; SignalWire delivers ~1.2 MB total anyway
+	mediaOutValidFor = 24 * time.Hour
+)
+
+// sendableTypes are the MMS types SignalWire accepts
+// (https://signalwire.com/docs/platform/messaging/mime-types).
+var sendableTypes = map[string]bool{
+	"audio/mp4": true, "audio/mpeg": true, "audio/mpeg3": true, "audio/ogg": true, "audio/vorbis": true,
+	"audio/vnd.wav": true, "audio/ac3": true, "audio/amr": true, "audio/midi": true,
+	"image/jpeg": true, "image/gif": true, "image/png": true, "image/bmp": true,
+	"text/plain": true, "text/calendar": true, "text/vcard": true, "text/x-vcard": true,
+	"video/mpeg": true, "video/mp4": true, "video/quicktime": true, "video/h264": true, "video/3gp": true,
+}
+
+func sendable(contentType string) bool {
+	t, _, _ := mime.ParseMediaType(contentType)
+	return sendableTypes[t]
+}
+
+// outMedia is a local file to attach to an outgoing message.
+type outMedia struct {
+	File string
+	Type string
+	Size int64
+}
+
+// saveUpload stores one uploaded file in MediaDir under a random name. The
+// type comes from the part's Content-Type, or is sniffed if that's missing.
+func (s *server) saveUpload(p io.Reader, declared string) (outMedia, error) {
+	head := make([]byte, 512)
+	n, err := io.ReadFull(p, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return outMedia{}, err
+	}
+	head = head[:n]
+	t, params, err := mime.ParseMediaType(declared)
+	if err != nil || t == "application/octet-stream" {
+		t, params, _ = mime.ParseMediaType(http.DetectContentType(head))
+	}
+	if !sendableTypes[t] {
+		return outMedia{}, &httpError{http.StatusUnsupportedMediaType, fmt.Sprintf("can't send media of type %q", t)}
+	}
+
+	f, err := os.CreateTemp(s.cfg.MediaDir, tempMediaPrefix+"*")
+	if err != nil {
+		return outMedia{}, err
+	}
+	defer os.Remove(f.Name()) // no-op after a successful rename
+	size, err := io.Copy(f, io.MultiReader(bytes.NewReader(head), p))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return outMedia{}, err
+	}
+	name := "out-" + strings.ToLower(rand.Text()) + mediaExt[t]
+	if err := os.Rename(f.Name(), filepath.Join(s.cfg.MediaDir, name)); err != nil {
+		return outMedia{}, err
+	}
+	return outMedia{File: name, Type: mime.FormatMediaType(t, params), Size: size}, nil
+}
+
+// storedMedia looks up a file smsd already has (e.g. a received attachment) for forwarding.
+func (s *server) storedMedia(ctx context.Context, name string) (outMedia, error) {
+	ct, err := s.store.MediaServedType(ctx, name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return outMedia{}, &httpError{http.StatusBadRequest, fmt.Sprintf("no media file %q", name)}
+	}
+	if err != nil {
+		return outMedia{}, err
+	}
+	if !sendable(ct) {
+		return outMedia{}, &httpError{http.StatusUnsupportedMediaType, fmt.Sprintf("can't send media of type %q", ct)}
+	}
+	fi, err := os.Stat(filepath.Join(s.cfg.MediaDir, name))
+	if err != nil {
+		return outMedia{}, err
+	}
+	return outMedia{File: name, Type: ct, Size: fi.Size()}, nil
+}
+
+// mediaOutSig signs a /media-out/ link. The type is part of the link so the
+// route needs no database row: SignalWire may fetch before the message is stored.
+func (s *server) mediaOutSig(name, contentType, exp string) []byte {
+	mac := hmac.New(sha256.New, s.mediaKey)
+	mac.Write([]byte(name + "\n" + contentType + "\n" + exp))
+	return mac.Sum(nil)
+}
+
+// mediaOutURL is a public link SignalWire can fetch an outgoing attachment from.
+func (s *server) mediaOutURL(m outMedia, now time.Time) string {
+	exp := strconv.FormatInt(now.Add(mediaOutValidFor).Unix(), 10)
+	q := url.Values{"type": {m.Type}, "exp": {exp}, "sig": {hex.EncodeToString(s.mediaOutSig(m.File, m.Type, exp))}}
+	return s.cfg.PublicURL + "/media-out/" + url.PathEscape(m.File) + "?" + q.Encode()
+}
+
+// handleMediaOut serves outgoing attachments to SignalWire. It's public, so
+// it serves only what a valid, unexpired signed link names.
+func (s *server) handleMediaOut(w http.ResponseWriter, r *http.Request) {
+	name, q := r.PathValue("name"), r.URL.Query()
+	ct, exp := q.Get("type"), q.Get("exp")
+	sig, err := hex.DecodeString(q.Get("sig"))
+	expAt, perr := strconv.ParseInt(exp, 10, 64)
+	if err != nil || perr != nil || time.Now().Unix() > expAt || !hmac.Equal(sig, s.mediaOutSig(name, ct, exp)) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	serveMediaFile(w, r, filepath.Join(s.cfg.MediaDir, name), ct)
 }

@@ -3,13 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -39,6 +45,7 @@ type server struct {
 	store    *Store
 	sw       *signalWire
 	notifier Notifier
+	mediaKey []byte // signs /media-out/ links
 
 	// Background work (notifier calls, media downloads) runs under ctx, which
 	// stop cancels. mu makes "check ctx, then wg.Add" atomic with stop, so no
@@ -51,7 +58,10 @@ type server struct {
 
 func newServer(cfg config, store *Store, sw *signalWire, notifier Notifier) *server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, ctx: ctx, cancel: cancel}
+	// Derived from APP_TOKEN so links stay valid across restarts; rotating the token revokes them.
+	mac := hmac.New(sha256.New, []byte(cfg.AppToken))
+	mac.Write([]byte("smsd media-out v1"))
+	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, mediaKey: mac.Sum(nil), ctx: ctx, cancel: cancel}
 }
 
 // background runs f in a goroutine unless the server is stopping. A panic is
@@ -101,6 +111,8 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/", s.verifySignalWire(webhooks))
 	mux.Handle("/api/", s.requireToken(api))
+	// SignalWire -> us, fetching outgoing attachments (signed, expiring links; checked in the handler)
+	mux.HandleFunc("GET /media-out/{name}", s.handleMediaOut)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 
 	return logRequests(mux)
@@ -337,38 +349,168 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, msgs)
 }
 
+// httpError is a client error with the status to report it with.
+type httpError struct {
+	status int
+	msg    string
+}
+
+func (e *httpError) Error() string { return e.msg }
+
+func writeError(w http.ResponseWriter, err error, what string) {
+	if he, ok := errors.AsType[*httpError](err); ok {
+		writeJSON(w, he.status, errBody(he.msg))
+		return
+	}
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		writeJSON(w, http.StatusRequestEntityTooLarge, errBody(fmt.Sprintf("request larger than %d bytes", maxUploadBytes)))
+		return
+	}
+	log.Printf("%s: %v", what, err)
+	writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
+}
+
+const maxBodyBytes = 16 << 10
+
+// parseSend reads a reply: either JSON {"body", "media_files"} or
+// multipart/form-data with "body", "media_files" (repeatable) and "media"
+// (uploaded files, repeatable) fields. Uploaded files are saved as they're
+// read; created lists them so the caller can remove them if the send fails.
+func (s *server) parseSend(r *http.Request) (body string, media []outMedia, created []string, err error) {
+	addStored := func(name string) error {
+		m, err := s.storedMedia(r.Context(), name)
+		if err == nil {
+			media = append(media, m)
+		}
+		return err
+	}
+
+	if ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); ct != "multipart/form-data" {
+		var req struct {
+			Body       string   `json:"body"`
+			MediaFiles []string `json:"media_files"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return "", nil, nil, &httpError{http.StatusBadRequest, `expected JSON {"body": "...", "media_files": [...]} or multipart/form-data`}
+		}
+		if len(req.MediaFiles) > maxSendMedia {
+			return "", nil, nil, &httpError{http.StatusBadRequest, fmt.Sprintf("at most %d media per message", maxSendMedia)}
+		}
+		for _, name := range req.MediaFiles {
+			if err := addStored(name); err != nil {
+				return "", nil, nil, err
+			}
+		}
+		return req.Body, media, nil, nil
+	}
+
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return "", nil, nil, &httpError{http.StatusBadRequest, "bad multipart body"}
+	}
+	for {
+		p, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return body, media, created, nil
+		}
+		if err != nil {
+			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				return "", nil, created, err
+			}
+			return "", nil, created, &httpError{http.StatusBadRequest, "bad multipart body"}
+		}
+		tooMany := &httpError{http.StatusBadRequest, fmt.Sprintf("at most %d media per message", maxSendMedia)}
+		switch field := p.FormName(); field {
+		case "body", "media_files":
+			v, err := io.ReadAll(io.LimitReader(p, maxBodyBytes+1))
+			if err != nil {
+				return "", nil, created, err
+			}
+			if len(v) > maxBodyBytes {
+				return "", nil, created, &httpError{http.StatusBadRequest, field + " too long"}
+			}
+			if field == "body" {
+				body = string(v)
+				continue
+			}
+			if len(media) == maxSendMedia {
+				return "", nil, created, tooMany
+			}
+			if err := addStored(string(v)); err != nil {
+				return "", nil, created, err
+			}
+		case "media":
+			if len(media) == maxSendMedia {
+				return "", nil, created, tooMany
+			}
+			m, err := s.saveUpload(p, p.Header.Get("Content-Type"))
+			if err != nil {
+				return "", nil, created, err
+			}
+			created = append(created, m.File)
+			media = append(media, m)
+		default:
+			return "", nil, created, &httpError{http.StatusBadRequest, fmt.Sprintf("unknown field %q", field)}
+		}
+	}
+}
+
 func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	peer, ok := peerParam(w, r)
 	if !ok {
 		return
 	}
-	var req struct {
-		Body string `json:"body"`
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	body, media, created, err := s.parseSend(r)
+	removeCreated := func() {
+		for _, f := range created {
+			os.Remove(filepath.Join(s.cfg.MediaDir, f))
+		}
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Body) == "" {
-		writeJSON(w, http.StatusBadRequest, errBody(`expected JSON {"body": "..."}`))
+	if err != nil {
+		removeCreated()
+		writeError(w, err, "read send request")
 		return
+	}
+	if strings.TrimSpace(body) == "" && len(media) == 0 {
+		removeCreated()
+		writeJSON(w, http.StatusBadRequest, errBody("a message needs a body or media"))
+		return
+	}
+
+	now := time.Now()
+	stored := make([]Media, len(media))
+	urls := make([]string, len(media))
+	for i, m := range media {
+		urls[i] = s.mediaOutURL(m, now)
+		stored[i] = Media{URL: urls[i], ContentType: m.Type, Size: m.Size, File: m.File, ServedType: m.Type}
 	}
 
 	// Once SignalWire accepts the message it is sent, so finish sending and
 	// recording it even if the client goes away. Send has its own timeout.
 	ctx := context.WithoutCancel(r.Context())
-	res, err := s.sw.Send(ctx, s.cfg.FromNumber, peer, req.Body, s.cfg.PublicURL+"/webhook/status")
+	res, err := s.sw.Send(ctx, s.cfg.FromNumber, peer, body, urls, s.cfg.PublicURL+"/webhook/status")
 	if err != nil {
 		log.Printf("send to %q: %v", peer, err)
 		if apiErr, ok := errors.AsType[*apiError](err); ok {
+			removeCreated()
 			writeJSON(w, http.StatusBadGateway, errBody(apiErr.Message))
 			return
 		}
 		if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+			// Keep uploads: SignalWire may have the message and still fetch them.
 			writeJSON(w, http.StatusGatewayTimeout, errBody("no response from SignalWire; the message may have been sent, check before retrying"))
 			return
 		}
+		removeCreated()
 		writeJSON(w, http.StatusBadGateway, errBody("send failed"))
 		return
 	}
 
+	var bodyPtr *string
+	if body != "" {
+		bodyPtr = &body
+	}
 	m := Message{
 		SignalWireID: res.ID,
 		ProjectID:    res.ProjectID,
@@ -376,8 +518,9 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Type:         res.Kind,
 		From:         s.cfg.FromNumber,
 		To:           peer,
-		Body:         &req.Body,
+		Body:         bodyPtr,
 		Segments:     res.NumberOfSegments,
+		Media:        stored,
 		Status:       res.Status,
 		ErrorCode:    errorCode(res.ErrorCode),
 		ErrorMessage: res.ErrorMessage,

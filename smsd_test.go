@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -685,5 +688,230 @@ func TestMigrations(t *testing.T) {
 	if st, err := openStore(path); err == nil {
 		st.Close()
 		t.Fatal("opened a database from a newer version")
+	}
+}
+
+// --- outbound media ---------------------------------------------------------
+
+type sentRequest struct {
+	Body  *string  `json:"body"`
+	Media []string `json:"media"`
+}
+
+// fakeSignalWire accepts sends and records the last one; status != 201 fails them.
+func fakeSignalWire(t *testing.T, status int) (*httptest.Server, *atomic.Pointer[sentRequest]) {
+	t.Helper()
+	var last atomic.Pointer[sentRequest]
+	var n atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req sentRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		last.Store(&req)
+		if status != 201 {
+			http.Error(w, `{"errors":[{"detail":"rejected"}]}`, status)
+			return
+		}
+		w.WriteHeader(201)
+		fmt.Fprintf(w, `{"id":"out%d","status":"queued","kind":"mms"}`, n.Add(1))
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &last
+}
+
+type part struct{ field, filename, contentType, content string }
+
+func multipartSend(t *testing.T, s *server, parts ...part) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for _, p := range parts {
+		h := textproto.MIMEHeader{}
+		disp := fmt.Sprintf(`form-data; name=%q`, p.field)
+		if p.filename != "" {
+			disp += fmt.Sprintf(`; filename=%q`, p.filename)
+		}
+		h.Set("Content-Disposition", disp)
+		if p.contentType != "" {
+			h.Set("Content-Type", p.contentType)
+		}
+		w, _ := mw.CreatePart(h)
+		w.Write([]byte(p.content))
+	}
+	mw.Close()
+	req := httptest.NewRequest("POST", "/api/conversations/%2B16135551234/messages", &buf)
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, req)
+	return rec
+}
+
+// fetchAsSignalWire GETs a /media-out/ link the way SignalWire would: no credentials.
+func fetchAsSignalWire(t *testing.T, s *server, link string) *httptest.ResponseRecorder {
+	t.Helper()
+	path := strings.TrimPrefix(link, s.cfg.PublicURL)
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	return rec
+}
+
+func outFiles(t *testing.T, s *server) []string {
+	t.Helper()
+	f, _ := filepath.Glob(filepath.Join(s.cfg.MediaDir, "out-*"))
+	return f
+}
+
+func TestSendWithUploadedMedia(t *testing.T) {
+	fake, last := fakeSignalWire(t, 201)
+	s := newTestServer(t, fake.URL)
+	rec := multipartSend(t, s,
+		part{"body", "", "", "look"},
+		part{"media", "cat.jpg", "image/jpeg", "fakejpeg"},
+		part{"media", "card.vcf", "", "BEGIN:VCARD\nEND:VCARD\n"}, // no type: sniffed as text/plain
+	)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("send: %d %s", rec.Code, rec.Body)
+	}
+	sent := last.Load()
+	if sent.Body == nil || *sent.Body != "look" || len(sent.Media) != 2 {
+		t.Fatalf("sent %+v", sent)
+	}
+	for i, want := range []struct{ body, ctype string }{{"fakejpeg", "image/jpeg"}, {"BEGIN:VCARD\nEND:VCARD\n", "text/plain; charset=utf-8"}} {
+		if !strings.HasPrefix(sent.Media[i], "https://sms.example.com/media-out/out-") {
+			t.Fatalf("media url %q", sent.Media[i])
+		}
+		got := fetchAsSignalWire(t, s, sent.Media[i])
+		if got.Code != 200 || got.Body.String() != want.body || got.Header().Get("Content-Type") != want.ctype {
+			t.Fatalf("fetch %d: %d %q %v", i, got.Code, got.Body, got.Header())
+		}
+	}
+
+	m := onlyMessage(t, s, "+16135551234")
+	if len(m.Media) != 2 || m.Media[0].File == "" || m.Media[0].ServedType != "image/jpeg" || m.Media[0].Size != 8 ||
+		m.Media[0].URL != sent.Media[0] {
+		t.Fatalf("stored %+v", m.Media)
+	}
+	// Sent media is also available through the authenticated API.
+	if rec := apiRequest(t, s, "GET", "/api/media/"+m.Media[0].File, ""); rec.Code != 200 || rec.Body.String() != "fakejpeg" {
+		t.Fatalf("api media: %d", rec.Code)
+	}
+}
+
+func TestSendMediaOnly(t *testing.T) {
+	fake, last := fakeSignalWire(t, 201)
+	s := newTestServer(t, fake.URL)
+	if rec := multipartSend(t, s, part{"media", "a.png", "image/png", "png"}); rec.Code != http.StatusCreated {
+		t.Fatalf("send: %d %s", rec.Code, rec.Body)
+	}
+	if sent := last.Load(); sent.Body != nil || len(sent.Media) != 1 {
+		t.Fatalf("sent %+v", sent)
+	}
+	if m := onlyMessage(t, s, "+16135551234"); m.Body != nil {
+		t.Fatalf("body %q", *m.Body)
+	}
+}
+
+func TestSendForwardsStoredMedia(t *testing.T) {
+	mediaSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/gif")
+		w.Write([]byte("gif"))
+	}))
+	defer mediaSrv.Close()
+	fake, last := fakeSignalWire(t, 201)
+	s := newTestServer(t, fake.URL)
+	useTLS(s, mediaSrv)
+	signedPost(t, s, "/webhook/sms", inbound("in1", "+16135559999", "+16135550000", "",
+		media{"url": mediaSrv.URL + "/g", "content_type": "image/gif", "size": 3}))
+	s.wg.Wait()
+	file := onlyMessage(t, s, "+16135559999").Media[0].File
+
+	rec := apiRequest(t, s, "POST", "/api/conversations/%2B16135551234/messages",
+		fmt.Sprintf(`{"body":"fwd","media_files":[%q]}`, file))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("forward: %d %s", rec.Code, rec.Body)
+	}
+	sent := last.Load()
+	if len(sent.Media) != 1 {
+		t.Fatalf("sent %+v", sent)
+	}
+	if got := fetchAsSignalWire(t, s, sent.Media[0]); got.Code != 200 || got.Body.String() != "gif" {
+		t.Fatalf("fetch: %d", got.Code)
+	}
+	if m := onlyMessage(t, s, "+16135551234"); len(m.Media) != 1 || m.Media[0].File != file {
+		t.Fatalf("stored %+v", m.Media)
+	}
+
+	// Multipart forwarding works too; unknown files are rejected.
+	if rec := multipartSend(t, s, part{"media_files", "", "", file}); rec.Code != http.StatusCreated {
+		t.Fatalf("multipart forward: %d %s", rec.Code, rec.Body)
+	}
+	if rec := apiRequest(t, s, "POST", "/api/conversations/%2B16135551234/messages", `{"media_files":["nope.jpg"]}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown file: %d", rec.Code)
+	}
+}
+
+func TestSendRejectsBadMedia(t *testing.T) {
+	fake, last := fakeSignalWire(t, 201)
+	s := newTestServer(t, fake.URL)
+
+	if rec := multipartSend(t, s, part{"media", "x.html", "text/html", "<script>"}); rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("html: %d", rec.Code)
+	}
+	if rec := multipartSend(t, s, part{"media", "x.bin", "", "\x00\x01\x02"}); rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("sniffed binary: %d", rec.Code)
+	}
+	var many []part
+	for i := 0; i < maxSendMedia+1; i++ {
+		many = append(many, part{"media", "a.png", "image/png", "png"})
+	}
+	if rec := multipartSend(t, s, many...); rec.Code != http.StatusBadRequest {
+		t.Fatalf("too many: %d", rec.Code)
+	}
+	if rec := multipartSend(t, s, part{"media", "big.png", "image/png", strings.Repeat("x", maxUploadBytes)}); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("too big: %d", rec.Code)
+	}
+	if rec := multipartSend(t, s, part{"other", "", "", "x"}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown field: %d", rec.Code)
+	}
+	if rec := multipartSend(t, s, part{"body", "", "", "  "}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty: %d", rec.Code)
+	}
+	if last.Load() != nil {
+		t.Fatal("a bad request reached SignalWire")
+	}
+	if f := outFiles(t, s); len(f) != 0 {
+		t.Fatalf("uploads left behind: %v", f)
+	}
+}
+
+func TestSendFailureRemovesUploads(t *testing.T) {
+	fake, _ := fakeSignalWire(t, 422)
+	s := newTestServer(t, fake.URL)
+	if rec := multipartSend(t, s, part{"media", "a.png", "image/png", "png"}); rec.Code != http.StatusBadGateway {
+		t.Fatalf("send: %d", rec.Code)
+	}
+	if f := outFiles(t, s); len(f) != 0 {
+		t.Fatalf("uploads left behind: %v", f)
+	}
+}
+
+func TestMediaOutRejectsBadLinks(t *testing.T) {
+	s := newTestServer(t, "")
+	os.WriteFile(filepath.Join(s.cfg.MediaDir, "out-x.png"), []byte("png"), 0o600)
+	m := outMedia{File: "out-x.png", Type: "image/png", Size: 3}
+	good := s.mediaOutURL(m, time.Now())
+	if rec := fetchAsSignalWire(t, s, good); rec.Code != 200 {
+		t.Fatalf("good link: %d", rec.Code)
+	}
+	expired := s.mediaOutURL(m, time.Now().Add(-mediaOutValidFor-time.Minute))
+	retyped := strings.Replace(good, "type=image%2Fpng", "type=text%2Fhtml", 1)
+	renamed := strings.Replace(good, "out-x.png", "test.db", 1)
+	for name, link := range map[string]string{
+		"expired": expired, "retyped": retyped, "renamed": renamed,
+		"no sig": good[:strings.Index(good, "&sig=")], "bad sig": good[:len(good)-2] + "00",
+	} {
+		if rec := fetchAsSignalWire(t, s, link); rec.Code != http.StatusForbidden {
+			t.Errorf("%s: got %d", name, rec.Code)
+		}
 	}
 }
