@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -35,7 +37,7 @@ type server struct {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// SignalWire -> us (signature-verified)
+	// SignalWire -> us (signature-verified JSON: SWML messaging webhook, status callbacks)
 	mux.Handle("POST /webhook/sms", s.verifySignalWire(http.HandlerFunc(s.handleInbound)))
 	mux.Handle("POST /webhook/status", s.verifySignalWire(http.HandlerFunc(s.handleStatus)))
 
@@ -54,61 +56,87 @@ func (s *server) routes() http.Handler {
 
 func (s *server) verifySignalWire(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "bad form", http.StatusBadRequest)
+		// The signature covers the raw body, so read it whole before anything parses it.
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
 		if !s.cfg.SkipSignature {
-			sig := r.Header.Get("X-SignalWire-Signature")
-			if sig == "" {
-				sig = r.Header.Get("X-Twilio-Signature")
-			}
 			// Must be the exact public URL SignalWire called, not what a proxy rewrote it to.
 			fullURL := s.cfg.PublicURL + r.URL.RequestURI()
-			if !validSignature(s.cfg.SigningKey, sig, fullURL, r.PostForm) {
+			if !validSignature(s.cfg.SigningKey, r.Header.Get("X-SignalWire-Signature"), fullURL, raw) {
 				log.Printf("rejected webhook: bad signature for %s", fullURL)
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
 		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
 		next.ServeHTTP(w, r)
 	})
 }
 
+// inboundPayload is what SignalWire POSTs to a SWML messaging webhook.
+type inboundPayload struct {
+	Message struct {
+		MessageID string  `json:"message_id"`
+		From      string  `json:"from"`
+		To        string  `json:"to"`
+		Body      *string `json:"body"` // null on media-only MMS
+		Media     []struct {
+			URL         string `json:"url"`
+			ContentType string `json:"content_type"`
+			Size        int64  `json:"size"`
+		} `json:"media"`
+		Timestamp string `json:"timestamp"`
+	} `json:"message"`
+}
+
 func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
-	f := r.PostForm
-	if f.Get("MessageSid") == "" {
-		// Without a SID, retries can't be deduplicated.
-		http.Error(w, "missing MessageSid", http.StatusBadRequest)
+	var p inboundPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad JSON", http.StatusBadRequest)
 		return
 	}
-	if to := f.Get("To"); to != s.cfg.FromNumber {
-		// Signed by our project, but for another number. Ack so it isn't retried.
-		log.Printf("ignoring inbound for %s (we are %s)", to, s.cfg.FromNumber)
-		writeEmptyResponse(w)
+	in := p.Message
+	if in.MessageID == "" {
+		// Without an ID, retries can't be deduplicated.
+		http.Error(w, "missing message_id", http.StatusBadRequest)
 		return
 	}
+	if in.To != s.cfg.FromNumber {
+		// Signed by our project, but for another number. Accept so it isn't retried.
+		log.Printf("ignoring inbound for %s (we are %s)", in.To, s.cfg.FromNumber)
+		writeReceive(w)
+		return
+	}
+
 	m := Message{
-		SID:       f.Get("MessageSid"),
+		SID:       in.MessageID,
 		Direction: Inbound,
-		Peer:      f.Get("From"),
-		Body:      f.Get("Body"),
+		Peer:      in.From,
 		Status:    "received",
 		CreatedAt: time.Now().UTC(),
 	}
-	if n, _ := strconv.Atoi(f.Get("NumMedia")); n > 0 {
-		for i := 0; i < n && i < 10; i++ {
-			if u := f.Get("MediaUrl" + strconv.Itoa(i)); u != "" {
-				m.Media = append(m.Media, u)
-			}
+	if in.Body != nil {
+		m.Body = *in.Body
+	}
+	if t, err := time.Parse(time.RFC3339, in.Timestamp); err == nil {
+		m.CreatedAt = t.UTC()
+	}
+	for i, md := range in.Media {
+		if i == 10 {
+			break
+		}
+		if md.URL != "" {
+			m.Media = append(m.Media, md.URL)
 		}
 	}
 
 	inserted, err := s.store.Insert(r.Context(), &m)
 	if err != nil {
 		log.Printf("store inbound: %v", err)
-		// 5xx makes SignalWire retry; the SID dedupe makes that safe.
+		// Lets SignalWire retry or use the fallback URL; the message_id dedupe makes that safe.
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
@@ -125,23 +153,43 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeEmptyResponse(w)
+	writeReceive(w)
 }
 
-// writeEmptyResponse acknowledges a webhook with empty cXML (no auto-reply).
-func writeEmptyResponse(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "application/xml")
-	w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`))
+// receiveSWML accepts an inbound message without replying.
+const receiveSWML = `{"version":"1.0.0","sections":{"main":[{"receive":{}}]}}`
+
+func writeReceive(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(receiveSWML))
+}
+
+// statusPayload is what SignalWire POSTs to an outbound message's status_callback.
+type statusPayload struct {
+	ID           string  `json:"id"`
+	Status       string  `json:"status"`
+	ErrorCode    any     `json:"error_code"` // provider-specific; not always a string
+	ErrorMessage *string `json:"error_message"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	sid, status := r.PostForm.Get("MessageSid"), r.PostForm.Get("MessageStatus")
-	if sid != "" && status != "" {
-		if err := s.store.UpdateStatus(r.Context(), sid, status); err != nil {
-			log.Printf("update status: %v", err)
-			http.Error(w, "store error", http.StatusInternalServerError)
-			return
-		}
+	var p statusPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, "bad JSON", http.StatusBadRequest)
+		return
+	}
+	if p.ID == "" || p.Status == "" {
+		log.Printf("status callback without id/status: %+v", p)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if p.ErrorMessage != nil {
+		log.Printf("message %s %s: %v %s", p.ID, p.Status, p.ErrorCode, *p.ErrorMessage)
+	}
+	if err := s.store.UpdateStatus(r.Context(), p.ID, p.Status); err != nil {
+		log.Printf("update status: %v", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -220,7 +268,7 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m := Message{
-		SID:       res.SID,
+		SID:       res.ID,
 		Direction: Outbound,
 		Peer:      peer,
 		Body:      req.Body,
@@ -229,8 +277,8 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.store.Insert(r.Context(), &m); err != nil {
 		// The SMS went out; we just failed to record it. Report that honestly.
-		log.Printf("store outbound %s: %v", res.SID, err)
-		writeJSON(w, http.StatusInternalServerError, errBody("sent but not stored: "+res.SID))
+		log.Printf("store outbound %s: %v", res.ID, err)
+		writeJSON(w, http.StatusInternalServerError, errBody("sent but not stored: "+res.ID))
 		return
 	}
 	writeJSON(w, http.StatusCreated, m)

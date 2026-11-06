@@ -1,23 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 )
 
-// signalWire is a tiny client for the Compatibility (LaML) REST API.
+// signalWire is a tiny client for SignalWire's native messaging REST API.
 type signalWire struct {
-	baseURL   string
+	baseURL   string // e.g. https://example.signalwire.com/api/messaging
 	space     string
 	projectID string
 	apiToken  string
@@ -27,7 +27,7 @@ type signalWire struct {
 
 func newSignalWire(space, projectID, apiToken string) *signalWire {
 	return &signalWire{
-		baseURL:   fmt.Sprintf("https://%s/api/laml/2010-04-01/Accounts/%s", space, projectID),
+		baseURL:   fmt.Sprintf("https://%s/api/messaging", space),
 		space:     space,
 		projectID: projectID,
 		apiToken:  apiToken,
@@ -37,33 +37,60 @@ func newSignalWire(space, projectID, apiToken string) *signalWire {
 }
 
 type sendResult struct {
-	SID    string `json:"sid"`
+	ID     string `json:"id"`
 	Status string `json:"status"`
 }
 
 type apiError struct {
-	Status  int    `json:"status"`
-	Code    any    `json:"code"`
-	Message string `json:"message"`
+	Status  int
+	Message string
 }
 
 func (e *apiError) Error() string {
-	return fmt.Sprintf("signalwire: %d %v: %s", e.Status, e.Code, e.Message)
+	return fmt.Sprintf("signalwire: %d: %s", e.Status, e.Message)
+}
+
+func parseAPIError(status int, raw []byte) *apiError {
+	var body struct {
+		Message string `json:"message"`
+		Errors  []struct {
+			Message string `json:"message"`
+			Detail  string `json:"detail"`
+		} `json:"errors"`
+	}
+	msg := ""
+	if json.Unmarshal(raw, &body) == nil {
+		msg = body.Message
+		if msg == "" && len(body.Errors) > 0 {
+			if msg = body.Errors[0].Detail; msg == "" {
+				msg = body.Errors[0].Message
+			}
+		}
+	}
+	if msg == "" {
+		msg = strings.TrimSpace(string(raw))
+	}
+	return &apiError{Status: status, Message: msg}
 }
 
 // Send creates an outbound SMS. statusCallback may be empty.
 func (c *signalWire) Send(ctx context.Context, from, to, body, statusCallback string) (*sendResult, error) {
-	form := url.Values{"From": {from}, "To": {to}, "Body": {body}}
-	if statusCallback != "" {
-		form.Set("StatusCallback", statusCallback)
+	payload, err := json.Marshal(struct {
+		From           string `json:"from"`
+		To             string `json:"to"`
+		Body           string `json:"body"`
+		StatusCallback string `json:"status_callback,omitempty"`
+	}{from, to, body, statusCallback})
+	if err != nil {
+		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/Messages.json", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/messages", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	req.SetBasicAuth(c.projectID, c.apiToken)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -77,16 +104,15 @@ func (c *signalWire) Send(ctx context.Context, from, to, body, statusCallback st
 	}
 
 	if resp.StatusCode/100 != 2 {
-		e := &apiError{Status: resp.StatusCode}
-		if json.Unmarshal(raw, e) != nil || e.Message == "" {
-			e.Message = strings.TrimSpace(string(raw))
-		}
-		return nil, e
+		return nil, parseAPIError(resp.StatusCode, raw)
 	}
 
 	var out sendResult
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("decode send response: %w", err)
+	}
+	if out.ID == "" {
+		return nil, fmt.Errorf("send response has no message id: %s", raw)
 	}
 	return &out, nil
 }
@@ -112,35 +138,21 @@ func (c *signalWire) Fetch(ctx context.Context, rawURL string) (*http.Response, 
 	return c.media.Do(req)
 }
 
-// computeSignature implements the Compatibility API (Twilio-style) webhook
-// signature: base64(HMAC-SHA1(key, fullURL + sorted(name+value...))).
-func computeSignature(key, fullURL string, params url.Values) string {
-	var b strings.Builder
-	b.WriteString(fullURL)
-
-	keys := make([]string, 0, len(params))
-	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		vals := append([]string(nil), params[k]...)
-		sort.Strings(vals)
-		for _, v := range vals {
-			b.WriteString(k)
-			b.WriteString(v)
-		}
-	}
-
+// webhookMAC is SignalWire's signature for JSON webhooks (SWML document
+// fetches, status callbacks): HMAC-SHA1(signing key, url + raw body).
+func webhookMAC(key, fullURL string, body []byte) []byte {
 	mac := hmac.New(sha1.New, []byte(key))
-	mac.Write([]byte(b.String()))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	mac.Write([]byte(fullURL))
+	mac.Write(body)
+	return mac.Sum(nil)
 }
 
-func validSignature(key, signature, fullURL string, params url.Values) bool {
+// validSignature checks a hex X-SignalWire-Signature header, matching
+// validateRequest in SignalWire's @signalwire/web-api package.
+func validSignature(key, signature, fullURL string, body []byte) bool {
 	if signature == "" {
 		return false
 	}
-	expected := computeSignature(key, fullURL, params)
-	return hmac.Equal([]byte(expected), []byte(signature))
+	want := hex.EncodeToString(webhookMAC(key, fullURL, body))
+	return hmac.Equal([]byte(want), []byte(strings.ToLower(signature)))
 }
