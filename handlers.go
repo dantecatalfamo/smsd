@@ -41,18 +41,24 @@ type server struct {
 }
 
 func (s *server) routes() http.Handler {
-	mux := http.NewServeMux()
-
 	// SignalWire -> us (signature-verified JSON: SWML messaging webhook, status callbacks)
-	mux.Handle("POST /webhook/sms", s.verifySignalWire(http.HandlerFunc(s.handleInbound)))
-	mux.Handle("POST /webhook/status", s.verifySignalWire(http.HandlerFunc(s.handleStatus)))
+	webhooks := http.NewServeMux()
+	webhooks.HandleFunc("POST /webhook/sms", s.handleInbound)
+	webhooks.HandleFunc("POST /webhook/status", s.handleStatus)
 
 	// Client -> us (bearer-token auth)
-	mux.Handle("GET /api/conversations", s.requireToken(http.HandlerFunc(s.handleConversations)))
-	mux.Handle("GET /api/conversations/{peer}", s.requireToken(http.HandlerFunc(s.handleMessages)))
-	mux.Handle("POST /api/conversations/{peer}/messages", s.requireToken(http.HandlerFunc(s.handleSend)))
-	mux.Handle("GET /api/media/{name}", s.requireToken(http.HandlerFunc(s.handleMedia)))
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/conversations", s.handleConversations)
+	api.HandleFunc("GET /api/conversations/{peer}", s.handleMessages)
+	api.HandleFunc("POST /api/conversations/{peer}/messages", s.handleSend)
+	api.HandleFunc("GET /api/media/{name}", s.handleMedia)
 
+	// Everything under these prefixes goes through the check, including paths
+	// with no route, so unauthenticated callers can't probe which routes exist.
+	// The inner muxes match full paths, so no prefix stripping is needed.
+	mux := http.NewServeMux()
+	mux.Handle("/webhook/", s.verifySignalWire(webhooks))
+	mux.Handle("/api/", s.requireToken(api))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 
 	return logRequests(mux)

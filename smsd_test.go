@@ -318,3 +318,32 @@ func TestMigrations(t *testing.T) {
 		t.Fatal("opened a database from a newer version")
 	}
 }
+
+// The auth checks wrap whole prefixes, not individual routes.
+func TestPrefixesAreProtected(t *testing.T) {
+	s := newTestServer(t, "")
+	h := s.routes()
+	cases := []struct {
+		method, path, auth string
+		want               int
+	}{
+		{"GET", "/api/nope", "", http.StatusUnauthorized},
+		{"GET", "/api/nope", "Bearer secret", http.StatusNotFound},
+		{"DELETE", "/api/conversations", "", http.StatusUnauthorized},
+		{"DELETE", "/api/conversations", "Bearer secret", http.StatusMethodNotAllowed},
+		{"GET", "/api/conversations/%2B16135551234", "Bearer secret", http.StatusOK}, // path values survive nesting
+		{"POST", "/webhook/nope", "", http.StatusForbidden},
+		{"GET", "/healthz", "", http.StatusOK},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(c.method, c.path, nil)
+		if c.auth != "" {
+			req.Header.Set("Authorization", c.auth)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("%s %s (auth %q): got %d, want %d", c.method, c.path, c.auth, rec.Code, c.want)
+		}
+	}
+}
