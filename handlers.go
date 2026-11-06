@@ -37,7 +37,7 @@ func (logNotifier) Inbound(m Message) {
 	if m.Body != nil {
 		n = len([]rune(*m.Body))
 	}
-	log.Printf("inbound %q from %q: %d chars, %d media", m.SignalWireID, m.Peer, n, len(m.Media))
+	log.Printf("inbound %q from %q to %q: %d chars, %d media", m.SignalWireID, m.Peer, m.Number, n, len(m.Media))
 }
 
 type server struct {
@@ -101,8 +101,9 @@ func (s *server) routes() http.Handler {
 	// Client -> us (bearer-token auth)
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/conversations", s.handleConversations)
-	api.HandleFunc("GET /api/conversations/{peer}", s.handleMessages)
-	api.HandleFunc("POST /api/conversations/{peer}/messages", s.handleSend)
+	api.HandleFunc("GET /api/numbers/{number}/conversations", s.handleConversations)
+	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}", s.handleMessages)
+	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/messages", s.handleSend)
 	api.HandleFunc("GET /api/media/{name}", s.handleMedia)
 
 	// Everything under these prefixes goes through the check, including paths
@@ -178,10 +179,10 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing message_id", http.StatusBadRequest)
 		return
 	}
-	// Signed by our project, but not an inbound message for our number.
-	// Accept it so SignalWire doesn't retry, and store nothing.
-	if in.Direction != string(Inbound) || in.To != s.cfg.FromNumber {
-		log.Printf("ignoring %q: direction %q to %q (we are %q)", in.MessageID, in.Direction, in.To, s.cfg.FromNumber)
+	// Signed by our project, so any number pointed at this webhook is ours.
+	// Anything else is accepted so SignalWire doesn't retry, and not stored.
+	if in.Direction != string(Inbound) || !addrPattern.MatchString(in.To) || !addrPattern.MatchString(in.From) {
+		log.Printf("ignoring %q: direction %q from %q to %q", in.MessageID, in.Direction, in.From, in.To)
 		writeReceive(w)
 		return
 	}
@@ -319,8 +320,14 @@ func (s *server) requireToken(next http.Handler) http.Handler {
 	})
 }
 
+// handleConversations lists conversations on one number, or on all of them
+// when the route has no {number}.
 func (s *server) handleConversations(w http.ResponseWriter, r *http.Request) {
-	convs, err := s.store.Conversations(r.Context())
+	number := r.PathValue("number")
+	if r.Pattern != "GET /api/conversations" && !validAddr(w, number, "number") {
+		return
+	}
+	convs, err := s.store.Conversations(r.Context(), number)
 	if err != nil {
 		log.Printf("list conversations: %v", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
@@ -330,7 +337,7 @@ func (s *server) handleConversations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
-	peer, ok := peerParam(w, r)
+	number, peer, ok := conversationParams(w, r)
 	if !ok {
 		return
 	}
@@ -340,7 +347,7 @@ func (s *server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	before, _ := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
 
-	msgs, err := s.store.Messages(r.Context(), peer, before, limit)
+	msgs, err := s.store.Messages(r.Context(), number, peer, before, limit)
 	if err != nil {
 		log.Printf("list messages: %v", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("internal error"))
@@ -456,7 +463,7 @@ func (s *server) parseSend(r *http.Request) (body string, media []outMedia, crea
 }
 
 func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
-	peer, ok := peerParam(w, r)
+	number, peer, ok := conversationParams(w, r)
 	if !ok {
 		return
 	}
@@ -489,9 +496,9 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// Once SignalWire accepts the message it is sent, so finish sending and
 	// recording it even if the client goes away. Send has its own timeout.
 	ctx := context.WithoutCancel(r.Context())
-	res, err := s.sw.Send(ctx, s.cfg.FromNumber, peer, body, urls, s.cfg.PublicURL+"/webhook/status")
+	res, err := s.sw.Send(ctx, number, peer, body, urls, s.cfg.PublicURL+"/webhook/status")
 	if err != nil {
-		log.Printf("send to %q: %v", peer, err)
+		log.Printf("send from %q to %q: %v", number, peer, err)
 		if apiErr, ok := errors.AsType[*apiError](err); ok {
 			removeCreated()
 			writeJSON(w, http.StatusBadGateway, errBody(apiErr.Message))
@@ -516,7 +523,7 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		ProjectID:    res.ProjectID,
 		Direction:    Outbound,
 		Type:         res.Kind,
-		From:         s.cfg.FromNumber,
+		From:         number,
 		To:           peer,
 		Body:         bodyPtr,
 		Segments:     res.NumberOfSegments,
@@ -540,17 +547,24 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers ----------------------------------------------------------------
 
-// peerPattern accepts E.164 numbers, short codes and alphanumeric sender IDs.
-// Sends to anything SignalWire can't deliver to come back as its own error.
-var peerPattern = regexp.MustCompile(`^\+?[0-9A-Za-z]{2,20}$`)
+// addrPattern accepts E.164 numbers, short codes and alphanumeric sender IDs,
+// for both our numbers and peers. Sends from a number the project doesn't
+// own, or to anything SignalWire can't deliver to, come back as its own error.
+var addrPattern = regexp.MustCompile(`^\+?[0-9A-Za-z]{2,20}$`)
 
-func peerParam(w http.ResponseWriter, r *http.Request) (string, bool) {
-	p := r.PathValue("peer")
-	if !peerPattern.MatchString(p) {
-		writeJSON(w, http.StatusBadRequest, errBody("peer must be a phone number like +16135551234, a short code, or a sender ID"))
-		return "", false
+func validAddr(w http.ResponseWriter, v, what string) bool {
+	if !addrPattern.MatchString(v) {
+		writeJSON(w, http.StatusBadRequest, errBody(what+" must be a phone number like +16135551234, a short code, or a sender ID"))
+		return false
 	}
-	return p, true
+	return true
+}
+
+// conversationParams reads {number} (ours) and {peer} from the path.
+func conversationParams(w http.ResponseWriter, r *http.Request) (number, peer string, ok bool) {
+	number, peer = r.PathValue("number"), r.PathValue("peer")
+	ok = validAddr(w, number, "number") && validAddr(w, peer, "peer")
+	return number, peer, ok
 }
 
 func errBody(msg string) map[string]string { return map[string]string{"error": msg} }

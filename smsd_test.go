@@ -28,7 +28,7 @@ func newTestServer(t *testing.T, swURL string) *server {
 	}
 	t.Cleanup(func() { st.Close() })
 	cfg := config{
-		PublicURL: "https://sms.example.com", SigningKey: "PSK_test", FromNumber: "+16135550000",
+		PublicURL: "https://sms.example.com", SigningKey: "PSK_test",
 		AppToken: "secret", ProjectID: "proj", APIToken: "tok",
 		MediaDir: dir, // shared with the DB, so tests show only recorded files are served
 	}
@@ -90,9 +90,11 @@ func statusCallback(id, status, ts string, errCode any, errMsg any) map[string]a
 	}
 }
 
+const us = "+16135550000" // our number in most tests
+
 func onlyMessage(t *testing.T, s *server, peer string) Message {
 	t.Helper()
-	msgs, err := s.store.Messages(t.Context(), peer, 0, 50)
+	msgs, err := s.store.Messages(t.Context(), us, peer, 0, 50)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("messages for %s: %+v, %v", peer, msgs, err)
 	}
@@ -124,7 +126,7 @@ func TestInboundStoresAndDedupes(t *testing.T) {
 
 	m := onlyMessage(t, s, "+16135551234")
 	if m.SignalWireID != "m1" || m.ProjectID != "proj" || m.SpaceID != "space" || m.Direction != Inbound ||
-		m.Type != "sms" || m.From != "+16135551234" || m.To != "+16135550000" || m.Peer != "+16135551234" ||
+		m.Type != "sms" || m.From != "+16135551234" || m.To != "+16135550000" || m.Number != us || m.Peer != "+16135551234" ||
 		m.Body == nil || *m.Body != "hi" || m.Segments == nil || *m.Segments != 1 || m.Status != "received" {
 		t.Fatalf("got %+v", m)
 	}
@@ -203,18 +205,63 @@ func TestSignatureEncoding(t *testing.T) {
 	}
 }
 
-func TestInboundIgnoresOtherNumbersAndDirections(t *testing.T) {
+func TestInboundIgnoresOtherDirectionsAndBadNumbers(t *testing.T) {
 	s := newTestServer(t, "")
-	other := inbound("m4", "+16135551234", "+16135559999", "hi")
-	outbound := inbound("m5", "+16135551234", "+16135550000", "hi")
+	outbound := inbound("m5", "+16135551234", us, "hi")
 	outbound["message"].(map[string]any)["direction"] = "outbound"
-	for _, p := range []map[string]any{other, outbound} {
+	for _, p := range []map[string]any{outbound, inbound("m6", "+16135551234", "", "hi"), inbound("m7", "", us, "hi")} {
 		if rec := signedPost(t, s, "/webhook/sms", p); rec.Code != 200 || rec.Body.String() != receiveSWML {
 			t.Fatalf("status %d", rec.Code)
 		}
 	}
-	if msgs, _ := s.store.Messages(t.Context(), "+16135551234", 0, 50); len(msgs) != 0 {
-		t.Fatalf("stored: %+v", msgs)
+	if convs, _ := s.store.Conversations(t.Context(), ""); len(convs) != 0 {
+		t.Fatalf("stored: %+v", convs)
+	}
+}
+
+// One peer texting two of our numbers gets a conversation on each, and
+// replies go out from the number in the path.
+func TestMultipleNumbers(t *testing.T) {
+	var froms []string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ From string }
+		json.NewDecoder(r.Body).Decode(&req)
+		froms = append(froms, req.From)
+		w.WriteHeader(201)
+		fmt.Fprintf(w, `{"id":"out%d","status":"queued"}`, len(froms))
+	}))
+	defer fake.Close()
+	s := newTestServer(t, fake.URL)
+	const other = "+16135559999"
+	signedPost(t, s, "/webhook/sms", inbound("a", "+16135551234", us, "to first"))
+	signedPost(t, s, "/webhook/sms", inbound("b", "+16135551234", other, "to second"))
+
+	if rec := apiRequest(t, s, "POST", "/api/numbers/%2B16135559999/conversations/%2B16135551234/messages", `{"body":"from second"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("send: %d %s", rec.Code, rec.Body)
+	}
+	if len(froms) != 1 || froms[0] != other {
+		t.Fatalf("sent from %v", froms)
+	}
+
+	var all []Conversation
+	json.Unmarshal(apiRequest(t, s, "GET", "/api/conversations", "").Body.Bytes(), &all)
+	if len(all) != 2 || all[0].Number != other || all[0].MessageCount != 2 || all[1].Number != us || all[1].MessageCount != 1 {
+		t.Fatalf("all conversations: %+v", all)
+	}
+	var mine []Conversation
+	json.Unmarshal(apiRequest(t, s, "GET", "/api/numbers/%2B16135550000/conversations", "").Body.Bytes(), &mine)
+	if len(mine) != 1 || mine[0].Number != us || *mine[0].LastBody != "to first" {
+		t.Fatalf("conversations on %s: %+v", us, mine)
+	}
+
+	var msgs []Message
+	json.Unmarshal(apiRequest(t, s, "GET", "/api/numbers/%2B16135559999/conversations/%2B16135551234", "").Body.Bytes(), &msgs)
+	if len(msgs) != 2 || *msgs[0].Body != "to second" || *msgs[1].Body != "from second" ||
+		msgs[1].From != other || msgs[1].Number != other || msgs[1].Peer != "+16135551234" {
+		t.Fatalf("messages on %s: %+v", other, msgs)
+	}
+	if rec := apiRequest(t, s, "GET", "/api/numbers/bad%20number/conversations", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad number: got %d", rec.Code)
 	}
 }
 
@@ -245,14 +292,14 @@ func TestSendListAndStatus(t *testing.T) {
 	s := newTestServer(t, fake.URL)
 
 	// A literal + in the path works as well as %2B.
-	if rec := apiRequest(t, s, "POST", "/api/conversations/+16135551234/messages", `{"body":"hello back"}`); rec.Code != http.StatusCreated {
+	if rec := apiRequest(t, s, "POST", "/api/numbers/+16135550000/conversations/+16135551234/messages", `{"body":"hello back"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("send: %d %s", rec.Code, rec.Body)
 	}
 
 	rec := apiRequest(t, s, "GET", "/api/conversations", "")
 	var convs []Conversation
 	json.Unmarshal(rec.Body.Bytes(), &convs)
-	if len(convs) != 1 || convs[0].Peer != "+16135551234" || convs[0].LastDirection != Outbound {
+	if len(convs) != 1 || convs[0].Number != us || convs[0].Peer != "+16135551234" || convs[0].LastDirection != Outbound {
 		t.Fatalf("conversations: %s", rec.Body)
 	}
 
@@ -346,7 +393,7 @@ func TestSendReportsAPIError(t *testing.T) {
 	}))
 	defer fake.Close()
 	s := newTestServer(t, fake.URL)
-	rec := apiRequest(t, s, "POST", "/api/conversations/%2B16135551234/messages", `{"body":"x"}`)
+	rec := apiRequest(t, s, "POST", "/api/numbers/%2B16135550000/conversations/%2B16135551234/messages", `{"body":"x"}`)
 	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "to is not a valid number") {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
@@ -364,7 +411,7 @@ func TestSendSurvivesClientDisconnect(t *testing.T) {
 	defer fake.Close()
 	s := newTestServer(t, fake.URL)
 
-	req := httptest.NewRequestWithContext(ctx, "POST", "/api/conversations/%2B16135551234/messages", strings.NewReader(`{"body":"x"}`))
+	req := httptest.NewRequestWithContext(ctx, "POST", "/api/numbers/%2B16135550000/conversations/%2B16135551234/messages", strings.NewReader(`{"body":"x"}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
 	s.routes().ServeHTTP(rec, req)
@@ -383,7 +430,7 @@ func TestSendTimeoutIsReportedAsUnknown(t *testing.T) {
 	defer func() { sendTimeout = old }()
 
 	s := newTestServer(t, fake.URL)
-	rec := apiRequest(t, s, "POST", "/api/conversations/%2B16135551234/messages", `{"body":"x"}`)
+	rec := apiRequest(t, s, "POST", "/api/numbers/%2B16135550000/conversations/%2B16135551234/messages", `{"body":"x"}`)
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
@@ -392,11 +439,11 @@ func TestSendTimeoutIsReportedAsUnknown(t *testing.T) {
 func TestShortCodeConversationsAreReachable(t *testing.T) {
 	s := newTestServer(t, "")
 	signedPost(t, s, "/webhook/sms", inbound("m1", "12345", "+16135550000", "Your code is 1234"))
-	rec := apiRequest(t, s, "GET", "/api/conversations/12345", "")
+	rec := apiRequest(t, s, "GET", "/api/numbers/%2B16135550000/conversations/12345", "")
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "Your code is 1234") {
 		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
-	if rec := apiRequest(t, s, "GET", "/api/conversations/bad%20peer", ""); rec.Code != http.StatusBadRequest {
+	if rec := apiRequest(t, s, "GET", "/api/numbers/%2B16135550000/conversations/bad%20peer", ""); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad peer: got %d", rec.Code)
 	}
 }
@@ -599,7 +646,7 @@ func TestPrefixesAreProtected(t *testing.T) {
 		{"GET", "/api/nope", "Basic secret", http.StatusUnauthorized},
 		{"DELETE", "/api/conversations", "", http.StatusUnauthorized},
 		{"DELETE", "/api/conversations", "Bearer secret", http.StatusMethodNotAllowed},
-		{"GET", "/api/conversations/%2B16135551234", "Bearer secret", http.StatusOK}, // path values survive nesting
+		{"GET", "/api/numbers/%2B16135550000/conversations/%2B16135551234", "Bearer secret", http.StatusOK}, // path values survive nesting
 		{"POST", "/webhook/nope", "", http.StatusForbidden},
 		{"GET", "/healthz", "", http.StatusOK},
 	}
@@ -630,7 +677,7 @@ func TestLogRequestsQuotesPath(t *testing.T) {
 func TestLoadConfig(t *testing.T) {
 	base := map[string]string{
 		"PUBLIC_URL": "https://sms.example.com/", "SW_SPACE": "x.signalwire.com", "SW_PROJECT_ID": "p",
-		"SW_API_TOKEN": "t", "SW_SIGNING_KEY": "k", "SW_FROM_NUMBER": "+16135550000", "APP_TOKEN": "a",
+		"SW_API_TOKEN": "t", "SW_SIGNING_KEY": "k", "APP_TOKEN": "a",
 	}
 	load := func(over map[string]string) (config, error) {
 		return loadConfig(func(k string) string {
@@ -650,7 +697,6 @@ func TestLoadConfig(t *testing.T) {
 		"url query":        {"PUBLIC_URL": "https://sms.example.com/?a=1"},
 		"url creds":        {"PUBLIC_URL": "https://u:p@sms.example.com"},
 		"space with url":   {"SW_SPACE": "https://x.signalwire.com"},
-		"number not e164":  {"SW_FROM_NUMBER": "16135550000"},
 		"skip sig exposed": {"SKIP_SIGNATURE": "1", "ADDR": ":8080"},
 	} {
 		if _, err := load(over); err == nil {
@@ -738,7 +784,7 @@ func multipartSend(t *testing.T, s *server, parts ...part) *httptest.ResponseRec
 		w.Write([]byte(p.content))
 	}
 	mw.Close()
-	req := httptest.NewRequest("POST", "/api/conversations/%2B16135551234/messages", &buf)
+	req := httptest.NewRequest("POST", "/api/numbers/%2B16135550000/conversations/%2B16135551234/messages", &buf)
 	req.Header.Set("Authorization", "Bearer secret")
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
@@ -825,7 +871,7 @@ func TestSendForwardsStoredMedia(t *testing.T) {
 	s.wg.Wait()
 	file := onlyMessage(t, s, "+16135559999").Media[0].File
 
-	rec := apiRequest(t, s, "POST", "/api/conversations/%2B16135551234/messages",
+	rec := apiRequest(t, s, "POST", "/api/numbers/%2B16135550000/conversations/%2B16135551234/messages",
 		fmt.Sprintf(`{"body":"fwd","media_files":[%q]}`, file))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("forward: %d %s", rec.Code, rec.Body)
@@ -845,7 +891,7 @@ func TestSendForwardsStoredMedia(t *testing.T) {
 	if rec := multipartSend(t, s, part{"media_files", "", "", file}); rec.Code != http.StatusCreated {
 		t.Fatalf("multipart forward: %d %s", rec.Code, rec.Body)
 	}
-	if rec := apiRequest(t, s, "POST", "/api/conversations/%2B16135551234/messages", `{"media_files":["nope.jpg"]}`); rec.Code != http.StatusBadRequest {
+	if rec := apiRequest(t, s, "POST", "/api/numbers/%2B16135550000/conversations/%2B16135551234/messages", `{"media_files":["nope.jpg"]}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown file: %d", rec.Code)
 	}
 }

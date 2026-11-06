@@ -1,9 +1,9 @@
 # smsd
 
-Minimal two-way SMS backend for a SignalWire number. It does three things:
+Minimal two-way SMS backend for one or more SignalWire numbers. It does three things:
 
 - Takes inbound SMS/MMS from SignalWire's webhook, checks the signature and stores the message (MMS media is downloaded locally)
-- Groups messages into conversations by the other party's number
+- Groups messages into conversations by your number and the other party's
 - Lets you send replies, with or without media, through a small bearer-token API
 
 Single binary, stdlib HTTP, SQLite via `modernc.org/sqlite` (no cgo).
@@ -23,7 +23,6 @@ Environment:
 | `SW_PROJECT_ID` | | API Credentials page |
 | `SW_API_TOKEN` | | API token; needs the Messaging scope |
 | `SW_SIGNING_KEY` | `PSK_...` | API Credentials page → Signing Key |
-| `SW_FROM_NUMBER` | `+16135550000` | Your SignalWire number, E.164 |
 | `APP_TOKEN` | long random string | Protects `/api/*` |
 | `ADDR` | `:8080` | optional |
 | `DB_PATH` | `smsd.db` | optional |
@@ -32,41 +31,44 @@ Environment:
 
 smsd checks these at startup and reports every missing or malformed one.
 
-In SignalWire, set the number's **Message Handling** to a **SWML Webhook**:
+In SignalWire, set **Message Handling** to a **SWML Webhook** on each number smsd should handle:
 `POST https://sms.example.com/webhook/sms`. smsd answers each inbound message with a SWML document that just `receive`s it.
 
 Webhooks are verified with `X-SignalWire-Signature`, which is hex HMAC-SHA1 of the URL plus the raw JSON body. Don't put basic-auth credentials in the webhook URL: SignalWire includes them in what it signs, and `PUBLIC_URL` won't have them.
 
-Inbound messages addressed to any number other than `SW_FROM_NUMBER`, or with a direction other than `inbound`, are acknowledged and dropped.
+Any number whose webhook points at smsd is handled; there is no list of numbers to configure. Replies can go out from any number in the SignalWire project, so keep numbers smsd shouldn't send from in a different project. Inbound messages with a direction other than `inbound` are acknowledged and dropped.
 
 ## API
 
-All `/api` calls need `Authorization: Bearer $APP_TOKEN`. A conversation's peer in the path can be an E.164 number (`+16135551234` or `%2B16135551234`), a short code, or an alphanumeric sender ID.
+All `/api` calls need `Authorization: Bearer $APP_TOKEN`. A conversation is between one of your numbers and a peer, and both are in the path. Each can be an E.164 number (`+16135551234` or `%2B16135551234`), a short code, or an alphanumeric sender ID.
 
 ```sh
-# list conversations (newest first)
+# list conversations on all your numbers (newest first)
 curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/conversations
 
-# messages in one conversation (oldest first; page with ?before=<id>&limit=50)
-curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/conversations/%2B16135551234
+# list conversations on one of your numbers
+curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/numbers/%2B16135550000/conversations
 
-# reply
+# messages in one conversation (oldest first; page with ?before=<id>&limit=50)
+curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/numbers/%2B16135550000/conversations/%2B16135551234
+
+# reply (sent from the number in the path)
 curl -H "Authorization: Bearer $APP_TOKEN" -d '{"body":"hey!"}' \
-  $PUBLIC_URL/api/conversations/%2B16135551234/messages
+  $PUBLIC_URL/api/numbers/%2B16135550000/conversations/%2B16135551234/messages
 
 # reply with media: upload files (repeat -F media=@... up to 7 times)
 curl -H "Authorization: Bearer $APP_TOKEN" -F body='look' -F media=@cat.jpg \
-  $PUBLIC_URL/api/conversations/%2B16135551234/messages
+  $PUBLIC_URL/api/numbers/%2B16135550000/conversations/%2B16135551234/messages
 
 # forward an attachment smsd already has (a media item's "file")
 curl -H "Authorization: Bearer $APP_TOKEN" -d '{"body":"fwd","media_files":["42-0.jpg"]}' \
-  $PUBLIC_URL/api/conversations/%2B16135551234/messages
+  $PUBLIC_URL/api/numbers/%2B16135550000/conversations/%2B16135551234/messages
 
 # fetch a saved MMS attachment (the name is a media item's "file")
 curl -H "Authorization: Bearer $APP_TOKEN" -O $PUBLIC_URL/api/media/42-0.jpg
 ```
 
-Messages carry every field SignalWire sends: `signalwire_id`, `project_id`, `space_id`, `direction` (`inbound`/`outbound`), `type` (`sms`/`mms`), `from`, `to`, `body` (null on media-only MMS), `segments`, `timestamp` (SignalWire's time) and `media`. smsd adds `peer` (the other party, which conversations are keyed on), `status`, `error_code`/`error_message`/`status_at` from the current status, and `created_at` (when smsd stored it). The exact payload SignalWire sent is also kept in the database's `raw` column.
+Messages carry every field SignalWire sends: `signalwire_id`, `project_id`, `space_id`, `direction` (`inbound`/`outbound`), `type` (`sms`/`mms`), `from`, `to`, `body` (null on media-only MMS), `segments`, `timestamp` (SignalWire's time) and `media`. smsd adds `number` (yours: `to` if inbound, `from` if outbound), `peer` (the other party), `status`, `error_code`/`error_message`/`status_at` from the current status, and `created_at` (when smsd stored it). The exact payload SignalWire sent is also kept in the database's `raw` column.
 
 Each `media` item has `url`, `content_type` and `size` as SignalWire reported them. Attachments are downloaded in the background over https (up to 25 MB each, 60s each) so they outlive SignalWire's URLs; `file` and `served_type` fill in once a download finishes. Downloads that fail or are cut off by a restart are retried at the next startup for messages from the last 72 hours.
 

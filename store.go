@@ -39,8 +39,9 @@ type Message struct {
 	Type         string     `json:"type,omitempty"` // sms or mms
 	From         string     `json:"from"`
 	To           string     `json:"to"`
-	Peer         string     `json:"peer"` // the other party: from if inbound, to if outbound; conversations are keyed on it
-	Body         *string    `json:"body"` // null on media-only MMS
+	Number       string     `json:"number"` // our number: to if inbound, from if outbound
+	Peer         string     `json:"peer"`   // the other party: from if inbound, to if outbound
+	Body         *string    `json:"body"`   // null on media-only MMS
 	Segments     *int       `json:"segments,omitempty"`
 	Media        []Media    `json:"media,omitempty"`
 	Status       string     `json:"status"`
@@ -66,7 +67,9 @@ type StatusEvent struct {
 	Raw          json.RawMessage
 }
 
+// Conversation is the thread between one of our numbers and one peer.
 type Conversation struct {
+	Number        string    `json:"number"`
 	Peer          string    `json:"peer"`
 	LastBody      *string   `json:"last_body"`
 	LastDirection Direction `json:"last_direction"`
@@ -91,6 +94,8 @@ CREATE TABLE messages (
 	type          TEXT,
 	from_number   TEXT    NOT NULL,
 	to_number     TEXT    NOT NULL,
+	local_number  TEXT    NOT NULL GENERATED ALWAYS AS
+		(CASE direction WHEN 'inbound' THEN to_number ELSE from_number END) STORED,
 	peer          TEXT    NOT NULL GENERATED ALWAYS AS
 		(CASE direction WHEN 'inbound' THEN from_number ELSE to_number END) STORED,
 	body          TEXT,
@@ -103,7 +108,7 @@ CREATE TABLE messages (
 	created_at    INTEGER NOT NULL,
 	raw           TEXT
 );
-CREATE INDEX messages_peer_id ON messages(peer, id);
+CREATE INDEX messages_conversation_id ON messages(local_number, peer, id);
 
 CREATE TABLE media (
 	message_id   INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -215,17 +220,17 @@ func (s *Store) Insert(ctx context.Context, m *Message) (inserted bool, err erro
 	defer tx.Rollback()
 
 	var id int64
-	var peer string
+	var number, peer string
 	err = tx.QueryRowContext(ctx,
 		`INSERT INTO messages (signalwire_id, project_id, space_id, direction, type, from_number, to_number,
 			body, segments, status, error_code, error_message, timestamp, status_at, created_at, raw)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (signalwire_id) DO NOTHING
-		 RETURNING id, peer`,
+		 RETURNING id, local_number, peer`,
 		m.SignalWireID, nullString(m.ProjectID), nullString(m.SpaceID), m.Direction, nullString(m.Type), m.From, m.To,
 		m.Body, m.Segments, m.Status, m.ErrorCode, m.ErrorMessage, toMillis(m.Timestamp), toMillis(m.StatusAt),
 		m.CreatedAt.UnixMilli(), nullString(string(m.Raw)),
-	).Scan(&id, &peer)
+	).Scan(&id, &number, &peer)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -255,7 +260,7 @@ func (s *Store) Insert(ctx context.Context, m *Message) (inserted bool, err erro
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
-	m.ID, m.Peer = id, peer
+	m.ID, m.Number, m.Peer = id, number, peer
 	return true, nil
 }
 
@@ -332,12 +337,16 @@ func (s *Store) MediaServedType(ctx context.Context, file string) (string, error
 	return ct, err
 }
 
-func (s *Store) Conversations(ctx context.Context) ([]Conversation, error) {
+// Conversations lists conversations newest first, on one of our numbers or,
+// if number is empty, on all of them.
+func (s *Store) Conversations(ctx context.Context, number string) ([]Conversation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT m.peer, m.body, m.direction, m.created_at, l.n
+		SELECT m.local_number, m.peer, m.body, m.direction, m.created_at, l.n
 		FROM messages m
-		JOIN (SELECT peer, MAX(id) AS id, COUNT(*) AS n FROM messages GROUP BY peer) l ON m.id = l.id
-		ORDER BY m.id DESC`)
+		JOIN (SELECT MAX(id) AS id, COUNT(*) AS n FROM messages
+			WHERE ?1 = '' OR local_number = ?1
+			GROUP BY local_number, peer) l ON m.id = l.id
+		ORDER BY m.id DESC`, number)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +356,7 @@ func (s *Store) Conversations(ctx context.Context) ([]Conversation, error) {
 	for rows.Next() {
 		var c Conversation
 		var ms int64
-		if err := rows.Scan(&c.Peer, &c.LastBody, &c.LastDirection, &ms, &c.MessageCount); err != nil {
+		if err := rows.Scan(&c.Number, &c.Peer, &c.LastBody, &c.LastDirection, &ms, &c.MessageCount); err != nil {
 			return nil, err
 		}
 		c.LastAt = time.UnixMilli(ms).UTC()
@@ -356,18 +365,18 @@ func (s *Store) Conversations(ctx context.Context) ([]Conversation, error) {
 	return out, rows.Err()
 }
 
-// Messages returns a conversation oldest-first. If beforeID > 0, only
+// Messages returns the conversation between number and peer oldest-first. If beforeID > 0, only
 // messages older than it are returned (for paging back through history).
-func (s *Store) Messages(ctx context.Context, peer string, beforeID int64, limit int) ([]Message, error) {
+func (s *Store) Messages(ctx context.Context, number, peer string, beforeID int64, limit int) ([]Message, error) {
 	if beforeID <= 0 {
 		beforeID = 1<<63 - 1
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, signalwire_id, COALESCE(project_id, ''), COALESCE(space_id, ''), direction, COALESCE(type, ''),
-			from_number, to_number, peer, body, segments, status, error_code, error_message,
+			from_number, to_number, local_number, peer, body, segments, status, error_code, error_message,
 			timestamp, status_at, created_at, raw
-		FROM (SELECT * FROM messages WHERE peer = ? AND id < ? ORDER BY id DESC LIMIT ?)
-		ORDER BY id ASC`, peer, beforeID, limit)
+		FROM (SELECT * FROM messages WHERE local_number = ? AND peer = ? AND id < ? ORDER BY id DESC LIMIT ?)
+		ORDER BY id ASC`, number, peer, beforeID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +390,7 @@ func (s *Store) Messages(ctx context.Context, peer string, beforeID int64, limit
 		var created int64
 		var raw sql.NullString
 		if err := rows.Scan(&m.ID, &m.SignalWireID, &m.ProjectID, &m.SpaceID, &m.Direction, &m.Type,
-			&m.From, &m.To, &m.Peer, &m.Body, &m.Segments, &m.Status, &m.ErrorCode, &m.ErrorMessage,
+			&m.From, &m.To, &m.Number, &m.Peer, &m.Body, &m.Segments, &m.Status, &m.ErrorCode, &m.ErrorMessage,
 			&ts, &statusAt, &created, &raw); err != nil {
 			return nil, err
 		}
@@ -397,7 +406,7 @@ func (s *Store) Messages(ctx context.Context, peer string, beforeID int64, limit
 		return out, err
 	}
 
-	// The page's id range also covers other peers' messages; byID keeps only this page's.
+	// The page's id range also covers other conversations' messages; byID keeps only this page's.
 	mrows, err := s.db.QueryContext(ctx, `
 		SELECT message_id, url, COALESCE(content_type, ''), COALESCE(size, 0), COALESCE(file, ''), COALESCE(served_type, '')
 		FROM media WHERE message_id BETWEEN ? AND ?

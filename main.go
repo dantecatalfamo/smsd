@@ -1,7 +1,7 @@
-// Command smsd is a minimal two-way SMS backend for a SignalWire number.
+// Command smsd is a minimal two-way SMS backend for SignalWire numbers.
 //
 // It receives inbound messages via webhook, stores them in SQLite, threads
-// them into conversations by the other party's number, and exposes a small
+// them into conversations by our number and the other party's, and exposes a small
 // authenticated JSON API for listing conversations and sending replies.
 package main
 
@@ -15,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -31,12 +30,9 @@ type config struct {
 	ProjectID     string
 	APIToken      string
 	SigningKey    string // from the API Credentials page; used to verify webhooks
-	FromNumber    string // your SignalWire number in E.164
 	AppToken      string // bearer token protecting /api/*
 	SkipSignature bool   // dev only; requires a loopback ADDR
 }
-
-var e164 = regexp.MustCompile(`^\+[1-9]\d{6,14}$`)
 
 func loadConfig(getenv func(string) string) (config, error) {
 	env := func(key, def string) string {
@@ -54,13 +50,12 @@ func loadConfig(getenv func(string) string) (config, error) {
 		ProjectID:     getenv("SW_PROJECT_ID"),
 		APIToken:      getenv("SW_API_TOKEN"),
 		SigningKey:    getenv("SW_SIGNING_KEY"),
-		FromNumber:    getenv("SW_FROM_NUMBER"),
 		AppToken:      getenv("APP_TOKEN"),
 		SkipSignature: getenv("SKIP_SIGNATURE") == "1",
 	}
 	required := map[string]string{
 		"PUBLIC_URL": c.PublicURL, "SW_SPACE": c.Space, "SW_PROJECT_ID": c.ProjectID,
-		"SW_API_TOKEN": c.APIToken, "SW_FROM_NUMBER": c.FromNumber, "APP_TOKEN": c.AppToken,
+		"SW_API_TOKEN": c.APIToken, "APP_TOKEN": c.AppToken,
 	}
 	if !c.SkipSignature {
 		required["SW_SIGNING_KEY"] = c.SigningKey
@@ -86,9 +81,6 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if strings.ContainsAny(c.Space, "/:") {
 		return c, fmt.Errorf("SW_SPACE must be a host name like example.signalwire.com, got %q", c.Space)
-	}
-	if !e164.MatchString(c.FromNumber) {
-		return c, fmt.Errorf("SW_FROM_NUMBER must be E.164 like +16135550000, got %q", c.FromNumber)
 	}
 	if c.SkipSignature {
 		host, _, err := net.SplitHostPort(c.Addr)
