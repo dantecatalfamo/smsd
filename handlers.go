@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -17,7 +18,8 @@ import (
 )
 
 // Notifier is the extension point for pushing inbound messages somewhere
-// (Telegram, Matrix, ntfy, email...). Swap logNotifier for a real one.
+// (Telegram, Matrix, ntfy, email...). Swap logNotifier for a real one. It runs
+// in the background, so it may block; it must not modify m.
 type Notifier interface {
 	Inbound(m Message)
 }
@@ -25,11 +27,11 @@ type Notifier interface {
 type logNotifier struct{}
 
 func (logNotifier) Inbound(m Message) {
-	body := ""
+	n := 0
 	if m.Body != nil {
-		body = *m.Body
+		n = len([]rune(*m.Body))
 	}
-	log.Printf("inbound from %s: %q (%d media)", m.Peer, body, len(m.Media))
+	log.Printf("inbound %q from %q: %d chars, %d media", m.SignalWireID, m.Peer, n, len(m.Media))
 }
 
 type server struct {
@@ -37,7 +39,47 @@ type server struct {
 	store    *Store
 	sw       *signalWire
 	notifier Notifier
-	wg       sync.WaitGroup // in-flight media downloads
+
+	// Background work (notifier calls, media downloads) runs under ctx, which
+	// stop cancels. mu makes "check ctx, then wg.Add" atomic with stop, so no
+	// Add can race the final Wait.
+	mu     sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+}
+
+func newServer(cfg config, store *Store, sw *signalWire, notifier Notifier) *server {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, ctx: ctx, cancel: cancel}
+}
+
+// background runs f in a goroutine unless the server is stopping. A panic is
+// logged instead of crashing the process.
+func (s *server) background(f func(ctx context.Context)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			if v := recover(); v != nil {
+				log.Printf("background task panicked: %v", v)
+			}
+		}()
+		f(s.ctx)
+	}()
+}
+
+// stop cancels background work and waits for it to finish.
+func (s *server) stop() {
+	s.mu.Lock()
+	s.cancel()
+	s.mu.Unlock()
+	s.wg.Wait()
 }
 
 func (s *server) routes() http.Handler {
@@ -71,6 +113,10 @@ func (s *server) verifySignalWire(next http.Handler) http.Handler {
 		// The signature covers the raw body, so read it whole before anything parses it.
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
 		if err != nil {
+			if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "bad body", http.StatusBadRequest)
 			return
 		}
@@ -78,7 +124,7 @@ func (s *server) verifySignalWire(next http.Handler) http.Handler {
 			// Must be the exact public URL SignalWire called, not what a proxy rewrote it to.
 			fullURL := s.cfg.PublicURL + r.URL.RequestURI()
 			if !validSignature(s.cfg.SigningKey, r.Header.Get("X-SignalWire-Signature"), fullURL, raw) {
-				log.Printf("rejected webhook: bad signature for %s", fullURL)
+				log.Printf("rejected webhook: bad signature for %q", fullURL)
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
@@ -120,12 +166,10 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing message_id", http.StatusBadRequest)
 		return
 	}
-	if in.Direction != "" && in.Direction != string(Inbound) {
-		log.Printf("inbound webhook %s with direction %q", in.MessageID, in.Direction)
-	}
-	if in.To != s.cfg.FromNumber {
-		// Signed by our project, but for another number. Accept so it isn't retried.
-		log.Printf("ignoring inbound for %s (we are %s)", in.To, s.cfg.FromNumber)
+	// Signed by our project, but not an inbound message for our number.
+	// Accept it so SignalWire doesn't retry, and store nothing.
+	if in.Direction != string(Inbound) || in.To != s.cfg.FromNumber {
+		log.Printf("ignoring %q: direction %q to %q (we are %q)", in.MessageID, in.Direction, in.To, s.cfg.FromNumber)
 		writeReceive(w)
 		return
 	}
@@ -147,7 +191,7 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		Raw:          raw,
 	}
 	for i := range m.Media {
-		m.Media[i].File = "" // ours to set, never SignalWire's
+		m.Media[i].File, m.Media[i].ServedType = "", "" // ours to set, never SignalWire's
 	}
 
 	inserted, err := s.store.Insert(r.Context(), &m)
@@ -158,15 +202,13 @@ func (s *server) handleInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if inserted {
-		s.notifier.Inbound(m)
+		s.background(func(context.Context) { s.notifier.Inbound(m) })
 		if len(m.Media) > 0 {
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-				defer cancel()
-				s.saveMedia(ctx, m)
-			}()
+			jobs := make([]mediaJob, len(m.Media))
+			for i, md := range m.Media {
+				jobs[i] = mediaJob{MessageID: m.ID, Position: i, Media: md}
+			}
+			s.background(func(ctx context.Context) { s.saveMedia(ctx, jobs) })
 		}
 	}
 
@@ -182,37 +224,42 @@ func writeReceive(w http.ResponseWriter) {
 }
 
 // statusPayload is what SignalWire POSTs to an outbound message's status_callback.
+// The whole callback is also stored raw.
 type statusPayload struct {
-	ID           string          `json:"id"`
-	Status       string          `json:"status"`
-	ErrorCode    json.RawMessage `json:"error_code"` // provider-specific; not always a string
-	ErrorMessage *string         `json:"error_message"`
-	Timestamp    string          `json:"timestamp"`
+	ID               string          `json:"id"`
+	Status           string          `json:"status"`
+	ErrorCode        json.RawMessage `json:"error_code"` // provider-specific; not always a string
+	ErrorMessage     *string         `json:"error_message"`
+	NumberOfSegments *int            `json:"number_of_segments"`
+	Timestamp        string          `json:"timestamp"`
 }
 
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	raw, _ := io.ReadAll(r.Body) // already read and bounded by verifySignalWire
 	var p statusPayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := json.Unmarshal(raw, &p); err != nil {
 		http.Error(w, "bad JSON", http.StatusBadRequest)
 		return
 	}
 	if p.ID == "" || p.Status == "" {
-		log.Printf("status callback without id/status: %+v", p)
+		log.Printf("status callback without id/status: %q", raw)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	u := StatusUpdate{
+	e := StatusEvent{
 		SignalWireID: p.ID,
 		Status:       p.Status,
 		ErrorCode:    errorCode(p.ErrorCode),
 		ErrorMessage: p.ErrorMessage,
+		Segments:     p.NumberOfSegments,
 		At:           parseTime(p.Timestamp, "status timestamp of "+p.ID),
+		Raw:          raw,
 	}
-	if u.ErrorMessage != nil {
-		log.Printf("message %s %s: %v %s", p.ID, p.Status, string(p.ErrorCode), *u.ErrorMessage)
+	if e.ErrorMessage != nil {
+		log.Printf("message %q %q: %s %q", p.ID, p.Status, p.ErrorCode, *e.ErrorMessage)
 	}
-	if err := s.store.UpdateStatus(r.Context(), u); err != nil {
-		log.Printf("update status: %v", err)
+	if err := s.store.AddStatus(r.Context(), e); err != nil {
+		log.Printf("store status: %v", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
@@ -249,9 +296,10 @@ func errorCode(raw json.RawMessage) *string {
 // --- API --------------------------------------------------------------------
 
 func (s *server) requireToken(next http.Handler) http.Handler {
-	want := []byte("Bearer " + s.cfg.AppToken)
+	want := []byte(s.cfg.AppToken)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+		scheme, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(token), want) != 1 {
 			writeJSON(w, http.StatusUnauthorized, errBody("unauthorized"))
 			return
 		}
@@ -302,17 +350,19 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody(`expected JSON {"body": "..."}`))
 		return
 	}
-	if len([]rune(req.Body)) > 1600 {
-		writeJSON(w, http.StatusBadRequest, errBody("body exceeds 1600 characters"))
-		return
-	}
 
-	res, err := s.sw.Send(r.Context(), s.cfg.FromNumber, peer, req.Body, s.cfg.PublicURL+"/webhook/status")
+	// Once SignalWire accepts the message it is sent, so finish sending and
+	// recording it even if the client goes away. Send has its own timeout.
+	ctx := context.WithoutCancel(r.Context())
+	res, err := s.sw.Send(ctx, s.cfg.FromNumber, peer, req.Body, s.cfg.PublicURL+"/webhook/status")
 	if err != nil {
-		log.Printf("send to %s: %v", peer, err)
-		var apiErr *apiError
-		if errors.As(err, &apiErr) {
+		log.Printf("send to %q: %v", peer, err)
+		if apiErr, ok := errors.AsType[*apiError](err); ok {
 			writeJSON(w, http.StatusBadGateway, errBody(apiErr.Message))
+			return
+		}
+		if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+			writeJSON(w, http.StatusGatewayTimeout, errBody("no response from SignalWire; the message may have been sent, check before retrying"))
 			return
 		}
 		writeJSON(w, http.StatusBadGateway, errBody("send failed"))
@@ -335,9 +385,10 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:    time.Now().UTC(),
 		Raw:          res.Raw,
 	}
-	if _, err := s.store.Insert(r.Context(), &m); err != nil {
+	inserted, err := s.store.Insert(ctx, &m)
+	if err != nil || !inserted {
 		// The SMS went out; we just failed to record it. Report that honestly.
-		log.Printf("store outbound %s: %v", res.ID, err)
+		log.Printf("store outbound %q: inserted=%v err=%v", res.ID, inserted, err)
 		writeJSON(w, http.StatusInternalServerError, errBody("sent but not stored: "+res.ID))
 		return
 	}
@@ -346,12 +397,14 @@ func (s *server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers ----------------------------------------------------------------
 
-var e164 = regexp.MustCompile(`^\+[1-9]\d{6,14}$`)
+// peerPattern accepts E.164 numbers, short codes and alphanumeric sender IDs.
+// Sends to anything SignalWire can't deliver to come back as its own error.
+var peerPattern = regexp.MustCompile(`^\+?[0-9A-Za-z]{2,20}$`)
 
 func peerParam(w http.ResponseWriter, r *http.Request) (string, bool) {
 	p := r.PathValue("peer")
-	if !e164.MatchString(p) {
-		writeJSON(w, http.StatusBadRequest, errBody("peer must be E.164, e.g. +16135551234 (URL-encode + as %2B)"))
+	if !peerPattern.MatchString(p) {
+		writeJSON(w, http.StatusBadRequest, errBody("peer must be a phone number like +16135551234, a short code, or a sender ID"))
 		return "", false
 	}
 	return p, true
@@ -372,11 +425,18 @@ type statusRecorder struct {
 
 func (s *statusRecorder) WriteHeader(code int) { s.status = code; s.ResponseWriter.WriteHeader(code) }
 
+// Unwrap lets http.ResponseController (write deadlines, Flush) reach the real writer.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// ReadFrom keeps the real writer's sendfile path for http.ServeFile.
+func (s *statusRecorder) ReadFrom(r io.Reader) (int64, error) { return io.Copy(s.ResponseWriter, r) }
+
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
-		log.Printf("%s %s %d %s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+		// %q: the path is attacker-controlled and could otherwise forge log lines.
+		log.Printf("%s %q %d %s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
 	})
 }

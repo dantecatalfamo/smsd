@@ -22,9 +22,10 @@ const (
 // Media is one MMS attachment as SignalWire described it, plus our local copy.
 type Media struct {
 	URL         string `json:"url"`
-	ContentType string `json:"content_type,omitempty"`
+	ContentType string `json:"content_type,omitempty"` // as SignalWire declared it
 	Size        int64  `json:"size,omitempty"`
-	File        string `json:"file,omitempty"` // local copy, served at /api/media/{file}
+	File        string `json:"file,omitempty"`        // local copy, served at /api/media/{file}
+	ServedType  string `json:"served_type,omitempty"` // Content-Type the local copy is served with
 }
 
 // Message mirrors SignalWire's message fields. Pointer fields are ones
@@ -46,7 +47,7 @@ type Message struct {
 	ErrorCode    *string    `json:"error_code,omitempty"`
 	ErrorMessage *string    `json:"error_message,omitempty"`
 	Timestamp    *time.Time `json:"timestamp,omitempty"` // SignalWire's time for the message
-	StatusAt     *time.Time `json:"status_at,omitempty"` // SignalWire's time for the latest status
+	StatusAt     *time.Time `json:"status_at,omitempty"` // SignalWire's time for the current status
 	CreatedAt    time.Time  `json:"created_at"`          // when smsd stored it
 
 	// Raw is the payload exactly as SignalWire sent it: the inbound webhook
@@ -54,13 +55,15 @@ type Message struct {
 	Raw json.RawMessage `json:"-"`
 }
 
-// StatusUpdate is one delivery status callback.
-type StatusUpdate struct {
+// StatusEvent is one delivery status callback.
+type StatusEvent struct {
 	SignalWireID string
 	Status       string
 	ErrorCode    *string
 	ErrorMessage *string
+	Segments     *int
 	At           *time.Time
+	Raw          json.RawMessage
 }
 
 type Conversation struct {
@@ -77,7 +80,7 @@ type Store struct{ db *sql.DB }
 // in SQLite's user_version. To change the schema, append a new entry. Never
 // edit one that has shipped. Times are unix milliseconds.
 var migrations = []string{
-	// 1: initial SWML-era schema
+	// 1: initial schema
 	`
 CREATE TABLE messages (
 	id            INTEGER PRIMARY KEY,
@@ -108,25 +111,33 @@ CREATE TABLE media (
 	url          TEXT    NOT NULL,
 	content_type TEXT,
 	size         INTEGER,
-	file         TEXT,
+	file         TEXT    UNIQUE,
+	served_type  TEXT,
 	PRIMARY KEY (message_id, position)
 );
 
--- Status callbacks that arrived before their message was stored (the callback
--- can beat the Send response). Applied and removed when the message is inserted.
-CREATE TABLE pending_status (
-	signalwire_id TEXT PRIMARY KEY,
+-- Every status callback, as received. A message's status columns are derived
+-- from these (see applyStatus), so out-of-order and early callbacks are harmless.
+-- Not keyed to messages: a callback can arrive before its message is stored.
+CREATE TABLE status_events (
+	id            INTEGER PRIMARY KEY,
+	signalwire_id TEXT    NOT NULL,
 	status        TEXT    NOT NULL,
 	error_code    TEXT,
 	error_message TEXT,
+	segments      INTEGER,
 	status_at     INTEGER,
-	received_at   INTEGER NOT NULL
+	received_at   INTEGER NOT NULL,
+	raw           TEXT    NOT NULL
 );
+CREATE INDEX status_events_signalwire_id ON status_events(signalwire_id);
 `,
 }
 
 func openStore(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	// _txlock=immediate: every transaction here writes, so take the write lock
+	// up front instead of failing to upgrade a read lock under contention.
+	db, err := sql.Open("sqlite", "file:"+path+"?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, err
 	}
@@ -138,41 +149,63 @@ func openStore(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// migrate applies any migrations the database hasn't had yet, each in its own
-// transaction together with its user_version bump.
+// migrate applies pending migrations one per transaction. The version is read
+// inside the (immediate) transaction, so concurrent starts can't both apply one.
 func migrate(db *sql.DB) error {
-	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
-		return err
-	}
-	if version > len(migrations) {
-		return fmt.Errorf("database schema version %d is newer than this smsd supports (%d)", version, len(migrations))
-	}
-	for v := version; v < len(migrations); v++ {
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(migrations[v]); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("migration %d: %w", v+1, err)
-		}
-		if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, v+1)); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
+	for {
+		done, err := migrateOne(db)
+		if done || err != nil {
 			return err
 		}
 	}
-	return nil
+}
+
+func migrateOne(db *sql.DB) (done bool, err error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var v int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return false, err
+	}
+	switch {
+	case v > len(migrations):
+		return false, fmt.Errorf("database schema version %d is newer than this smsd supports (%d)", v, len(migrations))
+	case v == len(migrations):
+		return true, nil
+	}
+	if _, err := tx.Exec(migrations[v]); err != nil {
+		return false, fmt.Errorf("migration %d: %w", v+1, err)
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, v+1)); err != nil {
+		return false, err
+	}
+	return false, tx.Commit()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// applyStatus sets a message's status columns from its newest status event:
+// latest SignalWire timestamp first, then furthest along, then latest arrival.
+// Messages without events keep the status they were stored with.
+const applyStatus = `
+UPDATE messages SET (status, error_code, error_message, status_at, segments) = (
+	SELECT e.status, e.error_code, e.error_message, e.status_at, COALESCE(e.segments, messages.segments)
+	FROM status_events e
+	WHERE e.signalwire_id = messages.signalwire_id
+	ORDER BY e.status_at DESC,
+		CASE e.status WHEN 'queued' THEN 0 WHEN 'initiated' THEN 1 WHEN 'sent' THEN 2 WHEN 'read' THEN 4 ELSE 3 END DESC,
+		e.id DESC
+	LIMIT 1)
+WHERE signalwire_id = ? AND EXISTS (SELECT 1 FROM status_events WHERE signalwire_id = ?)
+RETURNING status, error_code, error_message, status_at, segments`
+
 // Insert stores a message and its media. Duplicate SignalWire IDs (webhook
-// retries) are ignored; inserted reports whether a new row was written. If a
-// status callback for the message arrived first, it is applied to the row and to m.
+// retries) are ignored; inserted reports whether a new row was written. Status
+// callbacks that arrived first are applied to the row and to m.
 func (s *Store) Insert(ctx context.Context, m *Message) (inserted bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -201,29 +234,21 @@ func (s *Store) Insert(ctx context.Context, m *Message) (inserted bool, err erro
 
 	for i, md := range m.Media {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO media (message_id, position, url, content_type, size, file) VALUES (?, ?, ?, ?, ?, ?)`,
-			id, i, md.URL, nullString(md.ContentType), md.Size, nullString(md.File)); err != nil {
+			`INSERT INTO media (message_id, position, url, content_type, size) VALUES (?, ?, ?, ?, ?)`,
+			id, i, md.URL, nullString(md.ContentType), md.Size); err != nil {
 			return false, err
 		}
 	}
 
-	var u StatusUpdate
 	var at sql.NullInt64
-	err = tx.QueryRowContext(ctx,
-		`DELETE FROM pending_status WHERE signalwire_id = ? RETURNING status, error_code, error_message, status_at`,
-		m.SignalWireID).Scan(&u.Status, &u.ErrorCode, &u.ErrorMessage, &at)
+	err = tx.QueryRowContext(ctx, applyStatus, m.SignalWireID, m.SignalWireID).
+		Scan(&m.Status, &m.ErrorCode, &m.ErrorMessage, &at, &m.Segments)
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, sql.ErrNoRows): // no early callbacks
 	case err != nil:
 		return false, err
 	default:
-		u.At = fromMillis(at)
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE messages SET status = ?, error_code = ?, error_message = ?, status_at = ? WHERE id = ?`,
-			u.Status, u.ErrorCode, u.ErrorMessage, toMillis(u.At), id); err != nil {
-			return false, err
-		}
-		m.Status, m.ErrorCode, m.ErrorMessage, m.StatusAt = u.Status, u.ErrorCode, u.ErrorMessage, u.At
+		m.StatusAt = fromMillis(at)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -233,45 +258,77 @@ func (s *Store) Insert(ctx context.Context, m *Message) (inserted bool, err erro
 	return true, nil
 }
 
-// UpdateStatus records a delivery status. If the message isn't stored yet,
-// the status is parked in pending_status for Insert to pick up.
-func (s *Store) UpdateStatus(ctx context.Context, u StatusUpdate) error {
+// AddStatus records a status callback and re-derives the message's status.
+func (s *Store) AddStatus(ctx context.Context, e StatusEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx,
-		`UPDATE messages SET status = ?, error_code = ?, error_message = ?, status_at = ? WHERE signalwire_id = ?`,
-		u.Status, u.ErrorCode, u.ErrorMessage, toMillis(u.At), u.SignalWireID)
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO status_events (signalwire_id, status, error_code, error_message, segments, status_at, received_at, raw)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.SignalWireID, e.Status, e.ErrorCode, e.ErrorMessage, e.Segments, toMillis(e.At),
+		time.Now().UnixMilli(), string(e.Raw)); err != nil {
+		return err
+	}
+	// RETURNING rows must be read for the statement to run to completion.
+	rows, err := tx.QueryContext(ctx, applyStatus, e.SignalWireID, e.SignalWireID)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		now := time.Now()
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO pending_status (signalwire_id, status, error_code, error_message, status_at, received_at)
-			 VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT (signalwire_id) DO UPDATE SET status = excluded.status, error_code = excluded.error_code,
-				error_message = excluded.error_message, status_at = excluded.status_at, received_at = excluded.received_at`,
-			u.SignalWireID, u.Status, u.ErrorCode, u.ErrorMessage, toMillis(u.At), now.UnixMilli()); err != nil {
-			return err
-		}
-		// Callbacks for messages we never stored (e.g. the insert failed) would otherwise pile up.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM pending_status WHERE received_at < ?`,
-			now.Add(-24*time.Hour).UnixMilli()); err != nil {
-			return err
-		}
+	for rows.Next() {
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
 
+// mediaJob is one attachment that still needs downloading.
+type mediaJob struct {
+	MessageID int64
+	Position  int
+	Media
+}
+
+// MissingMedia lists attachments of messages stored since the given time
+// whose download hasn't succeeded yet.
+func (s *Store) MissingMedia(ctx context.Context, since time.Time) ([]mediaJob, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT media.message_id, media.position, media.url, COALESCE(media.content_type, ''), COALESCE(media.size, 0)
+		FROM media JOIN messages ON messages.id = media.message_id
+		WHERE media.file IS NULL AND messages.created_at >= ?
+		ORDER BY media.message_id, media.position`, since.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []mediaJob
+	for rows.Next() {
+		var j mediaJob
+		if err := rows.Scan(&j.MessageID, &j.Position, &j.URL, &j.ContentType, &j.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 // SetMediaFile records the local copy of one attachment.
-func (s *Store) SetMediaFile(ctx context.Context, messageID int64, position int, file string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE media SET file = ? WHERE message_id = ? AND position = ?`,
-		file, messageID, position)
+func (s *Store) SetMediaFile(ctx context.Context, messageID int64, position int, file, servedType string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE media SET file = ?, served_type = ? WHERE message_id = ? AND position = ?`,
+		file, servedType, messageID, position)
 	return err
+}
+
+// MediaServedType returns the Content-Type for a local media file, or
+// sql.ErrNoRows if smsd never wrote a file by that name.
+func (s *Store) MediaServedType(ctx context.Context, file string) (string, error) {
+	var ct string
+	err := s.db.QueryRowContext(ctx, `SELECT served_type FROM media WHERE file = ?`, file).Scan(&ct)
+	return ct, err
 }
 
 func (s *Store) Conversations(ctx context.Context) ([]Conversation, error) {
@@ -339,11 +396,11 @@ func (s *Store) Messages(ctx context.Context, peer string, beforeID int64, limit
 		return out, err
 	}
 
+	// The page's id range also covers other peers' messages; byID keeps only this page's.
 	mrows, err := s.db.QueryContext(ctx, `
-		SELECT media.message_id, media.url, COALESCE(media.content_type, ''), COALESCE(media.size, 0), COALESCE(media.file, '')
-		FROM media JOIN messages ON messages.id = media.message_id
-		WHERE messages.peer = ? AND media.message_id BETWEEN ? AND ?
-		ORDER BY media.message_id, media.position`, peer, out[0].ID, out[len(out)-1].ID)
+		SELECT message_id, url, COALESCE(content_type, ''), COALESCE(size, 0), COALESCE(file, ''), COALESCE(served_type, '')
+		FROM media WHERE message_id BETWEEN ? AND ?
+		ORDER BY message_id, position`, out[0].ID, out[len(out)-1].ID)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +408,7 @@ func (s *Store) Messages(ctx context.Context, peer string, beforeID int64, limit
 	for mrows.Next() {
 		var id int64
 		var md Media
-		if err := mrows.Scan(&id, &md.URL, &md.ContentType, &md.Size, &md.File); err != nil {
+		if err := mrows.Scan(&id, &md.URL, &md.ContentType, &md.Size, &md.File, &md.ServedType); err != nil {
 			return nil, err
 		}
 		if i, ok := byID[id]; ok {

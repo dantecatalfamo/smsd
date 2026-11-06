@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,19 +22,35 @@ type signalWire struct {
 	space     string
 	projectID string
 	apiToken  string
-	http      *http.Client
-	media     *http.Client // longer timeout for MMS downloads
+	http      *http.Client // timeouts come from each call's context
 }
 
+var sendTimeout = 15 * time.Second // var for tests
+
 func newSignalWire(space, projectID, apiToken string) *signalWire {
-	return &signalWire{
+	c := &signalWire{
 		baseURL:   fmt.Sprintf("https://%s/api/messaging", space),
 		space:     space,
 		projectID: projectID,
 		apiToken:  apiToken,
-		http:      &http.Client{Timeout: 15 * time.Second},
-		media:     &http.Client{Timeout: 60 * time.Second},
 	}
+	c.http = &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		// Go keeps Authorization on same-host redirects even when the port or
+		// scheme changes; only keep it for https to our own space.
+		if !c.ownSpace(req.URL) {
+			req.Header.Del("Authorization")
+		}
+		return nil
+	}}
+	return c
+}
+
+// ownSpace reports whether credentials may be sent to u.
+func (c *signalWire) ownSpace(u *url.URL) bool {
+	return u.Scheme == "https" && strings.EqualFold(u.Host, c.space)
 }
 
 // sendResult is the create-message response.
@@ -84,6 +101,8 @@ func parseAPIError(status int, raw []byte) *apiError {
 
 // Send creates an outbound SMS. statusCallback may be empty.
 func (c *signalWire) Send(ctx context.Context, from, to, body, statusCallback string) (*sendResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
 	payload, err := json.Marshal(struct {
 		From           string `json:"from"`
 		To             string `json:"to"`
@@ -127,25 +146,24 @@ func (c *signalWire) Send(ctx context.Context, from, to, body, statusCallback st
 	return &out, nil
 }
 
-// Fetch GETs a media URL from an inbound MMS. Credentials are only sent to our
-// own space; media can also be served from elsewhere (e.g. a CDN). The http
-// client drops them on cross-host redirects.
+// Fetch GETs a media URL from an inbound MMS. Only https is allowed, and
+// credentials only go to our own space (media can also be served from a CDN).
 func (c *signalWire) Fetch(ctx context.Context, rawURL string) (*http.Response, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return nil, fmt.Errorf("unsupported media URL scheme %q", u.Scheme)
+	if u.Scheme != "https" {
+		return nil, fmt.Errorf("refusing non-https media URL %q", rawURL)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
-	if u.Host == c.space {
+	if c.ownSpace(u) {
 		req.SetBasicAuth(c.projectID, c.apiToken)
 	}
-	return c.media.Do(req)
+	return c.http.Do(req)
 }
 
 // webhookMAC is SignalWire's signature for JSON webhooks (SWML document
@@ -158,11 +176,9 @@ func webhookMAC(key, fullURL string, body []byte) []byte {
 }
 
 // validSignature checks a hex X-SignalWire-Signature header, matching
-// validateRequest in SignalWire's @signalwire/web-api package.
+// validateRequest in SignalWire's @signalwire/web-api package. Empty or
+// non-hex signatures fail to decode and are rejected.
 func validSignature(key, signature, fullURL string, body []byte) bool {
-	if signature == "" {
-		return false
-	}
-	want := hex.EncodeToString(webhookMAC(key, fullURL, body))
-	return hmac.Equal([]byte(want), []byte(strings.ToLower(signature)))
+	got, err := hex.DecodeString(signature)
+	return err == nil && hmac.Equal(got, webhookMAC(key, fullURL, body))
 }

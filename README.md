@@ -18,8 +18,8 @@ Environment:
 
 | Var | Example | Notes |
 |---|---|---|
-| `PUBLIC_URL` | `https://sms.example.com` | Exact public base URL SignalWire calls. Used for signature checks and the status callback. |
-| `SW_SPACE` | `yourspace.signalwire.com` | |
+| `PUBLIC_URL` | `https://sms.example.com` | Exact public base URL SignalWire calls. Used for signature checks and the status callback. A path prefix is allowed; a query, fragment or credentials are not. |
+| `SW_SPACE` | `yourspace.signalwire.com` | Host name only, no `https://` |
 | `SW_PROJECT_ID` | | API Credentials page |
 | `SW_API_TOKEN` | | API token; needs the Messaging scope |
 | `SW_SIGNING_KEY` | `PSK_...` | API Credentials page → Signing Key |
@@ -28,18 +28,20 @@ Environment:
 | `ADDR` | `:8080` | optional |
 | `DB_PATH` | `smsd.db` | optional |
 | `MEDIA_DIR` | `media` | optional; where inbound MMS media is saved |
-| `SKIP_SIGNATURE` | `1` | dev only |
+| `SKIP_SIGNATURE` | `1` | dev only; refused unless `ADDR` is loopback, e.g. `127.0.0.1:8080` |
+
+smsd checks these at startup and reports every missing or malformed one.
 
 In SignalWire, set the number's **Message Handling** to a **SWML Webhook**:
 `POST https://sms.example.com/webhook/sms`. smsd answers each inbound message with a SWML document that just `receive`s it.
 
 Webhooks are verified with `X-SignalWire-Signature`, which is hex HMAC-SHA1 of the URL plus the raw JSON body. Don't put basic-auth credentials in the webhook URL: SignalWire includes them in what it signs, and `PUBLIC_URL` won't have them.
 
-Inbound messages addressed to any number other than `SW_FROM_NUMBER` are acknowledged and dropped.
+Inbound messages addressed to any number other than `SW_FROM_NUMBER`, or with a direction other than `inbound`, are acknowledged and dropped.
 
 ## API
 
-All `/api` calls need `Authorization: Bearer $APP_TOKEN`. Write `+` in the path as `%2B`.
+All `/api` calls need `Authorization: Bearer $APP_TOKEN`. A conversation's peer in the path can be an E.164 number (`+16135551234` or `%2B16135551234`), a short code, or an alphanumeric sender ID.
 
 ```sh
 # list conversations (newest first)
@@ -53,17 +55,21 @@ curl -H "Authorization: Bearer $APP_TOKEN" -d '{"body":"hey!"}' \
   $PUBLIC_URL/api/conversations/%2B16135551234/messages
 
 # fetch a saved MMS attachment (the name is a media item's "file")
-curl -H "Authorization: Bearer $APP_TOKEN" -O $PUBLIC_URL/api/media/<signalwire_id>-0.jpg
+curl -H "Authorization: Bearer $APP_TOKEN" -O $PUBLIC_URL/api/media/42-0.jpg
 ```
 
-Messages carry every field SignalWire sends: `signalwire_id`, `project_id`, `space_id`, `direction` (`inbound`/`outbound`), `type` (`sms`/`mms`), `from`, `to`, `body` (null on media-only MMS), `segments`, `timestamp` (SignalWire's time) and `media`. smsd adds `peer` (the other party, which conversations are keyed on), `status`, `error_code`/`error_message`/`status_at` from the latest status callback, and `created_at` (when smsd stored it). The exact payload SignalWire sent is also kept in the database's `raw` column.
+Messages carry every field SignalWire sends: `signalwire_id`, `project_id`, `space_id`, `direction` (`inbound`/`outbound`), `type` (`sms`/`mms`), `from`, `to`, `body` (null on media-only MMS), `segments`, `timestamp` (SignalWire's time) and `media`. smsd adds `peer` (the other party, which conversations are keyed on), `status`, `error_code`/`error_message`/`status_at` from the current status, and `created_at` (when smsd stored it). The exact payload SignalWire sent is also kept in the database's `raw` column.
 
-Each `media` item has `url`, `content_type` and `size` as SignalWire reported them. Attachments are downloaded in the background (up to 25 MB each) so they outlive SignalWire's URLs, and `file` fills in once the download finishes.
+Each `media` item has `url`, `content_type` and `size` as SignalWire reported them. Attachments are downloaded in the background over https (up to 25 MB each, 60s each) so they outlive SignalWire's URLs; `file` and `served_type` fill in once a download finishes. Downloads that fail or are cut off by a restart are retried at the next startup for messages from the last 72 hours.
 
-Replies go out through SignalWire's messaging REST API (`POST /api/messaging/messages`). Delivery status updates arrive at `POST /webhook/status` and update the message's `status`, `error_code`, `error_message` and `status_at`. A callback that arrives before its message is stored is held and applied when the message is stored.
+`/api/media/{file}` serves only files smsd downloaded, with the type recorded at download time (`served_type`). Images, audio and video display inline; anything else (HTML, SVG, text, vCards...) is sent as a download. Every response carries `Content-Security-Policy: sandbox` and `X-Content-Type-Options: nosniff`.
+
+Replies go out through SignalWire's messaging REST API (`POST /api/messaging/messages`). A reply is recorded even if the client disconnects mid-request. If SignalWire doesn't answer within 15s the API returns 504: the message may have gone out, so check before retrying.
+
+Delivery status callbacks arrive at `POST /webhook/status` and are all kept, raw, in the `status_events` table. A message's `status`, `error_code`, `error_message` and `status_at` come from its newest event (by SignalWire's timestamp, then how far along the status is), so callbacks that arrive out of order or before the message is stored can't overwrite a newer status.
 
 ## Extending
 
-- **Notifications / chat bridge:** implement `Notifier` (`handlers.go`) and replace `logNotifier` in `main.go`. That's where Telegram, Matrix or ntfy plugs in. To reply from the bridge, call `sw.Send` and `store.Insert` the same way `handleSend` does.
+- **Notifications / chat bridge:** implement `Notifier` (`handlers.go`) and replace `logNotifier` in `main.go`. That's where Telegram, Matrix or ntfy plugs in. It runs in the background, so it can block without delaying SignalWire's webhook. To reply from the bridge, call `sw.Send` and `store.Insert` the same way `handleSend` does.
 - **Auto-replies:** in `handleInbound`, return a SWML document with a `reply` step in place of `receive`, e.g. `{"version":"1.0.0","sections":{"main":[{"reply":{"body":"Thanks!"}}]}}`. A reply sent that way isn't stored in the database.
 - **Behind a reverse proxy:** `PUBLIC_URL` must match what SignalWire calls exactly (scheme, host, port), or signature checks fail.
