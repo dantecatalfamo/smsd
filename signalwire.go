@@ -16,9 +16,9 @@ import (
 	"time"
 )
 
-// signalWire is a tiny client for SignalWire's native messaging REST API.
+// signalWire is a tiny client for SignalWire's native REST APIs.
 type signalWire struct {
-	baseURL   string // e.g. https://example.signalwire.com/api/messaging
+	baseURL   string // e.g. https://example.signalwire.com/api
 	space     string
 	projectID string
 	apiToken  string
@@ -29,7 +29,7 @@ var sendTimeout = 15 * time.Second // var for tests
 
 func newSignalWire(space, projectID, apiToken string) *signalWire {
 	c := &signalWire{
-		baseURL:   fmt.Sprintf("https://%s/api/messaging", space),
+		baseURL:   fmt.Sprintf("https://%s/api", space),
 		space:     space,
 		projectID: projectID,
 		apiToken:  apiToken,
@@ -115,7 +115,7 @@ func (c *signalWire) Send(ctx context.Context, from, to, body string, media []st
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/messages", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/messaging/messages", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +146,61 @@ func (c *signalWire) Send(ctx context.Context, from, to, body string, media []st
 	}
 	out.Raw = raw
 	return &out, nil
+}
+
+// maxNumberPages bounds PhoneNumbers, at 1000 numbers a page.
+const maxNumberPages = 20
+
+// PhoneNumbers lists every phone number the project owns, as SignalWire
+// describes them, following pagination.
+func (c *signalWire) PhoneNumbers(ctx context.Context) ([]json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+	out := []json.RawMessage{}
+	query := url.Values{"page_size": {"1000"}}
+	for page := 0; ; page++ {
+		if page == maxNumberPages {
+			return nil, fmt.Errorf("more than %d pages of phone numbers", maxNumberPages)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/relay/rest/phone_numbers?"+query.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.SetBasicAuth(c.projectID, c.apiToken)
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode/100 != 2 {
+			return nil, parseAPIError(resp.StatusCode, raw)
+		}
+		var body struct {
+			Links struct {
+				Next string `json:"next"`
+			} `json:"links"`
+			Data []json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return nil, fmt.Errorf("decode phone numbers: %w", err)
+		}
+		out = append(out, body.Data...)
+		if body.Links.Next == "" {
+			return out, nil
+		}
+		// Take only the paging parameters from the next link, so the request
+		// (and our credentials) still go to our own space.
+		next, err := url.Parse(body.Links.Next)
+		if err != nil {
+			return nil, fmt.Errorf("bad next link %q: %w", body.Links.Next, err)
+		}
+		query = next.Query()
+	}
 }
 
 // Fetch GETs a media URL from an inbound MMS. Only https is allowed, and

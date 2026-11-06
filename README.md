@@ -21,7 +21,7 @@ Environment:
 | `PUBLIC_URL` | `https://sms.example.com` | Exact public base URL SignalWire calls. Used for signature checks and the status callback. A path prefix is allowed; a query, fragment or credentials are not. |
 | `SW_SPACE` | `yourspace.signalwire.com` | Host name only, no `https://` |
 | `SW_PROJECT_ID` | | API Credentials page |
-| `SW_API_TOKEN` | | API token; needs the Messaging scope |
+| `SW_API_TOKEN` | | API token; needs the Messaging and Numbers scopes |
 | `SW_SIGNING_KEY` | `PSK_...` | API Credentials page → Signing Key |
 | `APP_TOKEN` | long random string | Protects `/api/*` |
 | `ADDR` | `:8080` | optional |
@@ -43,6 +43,9 @@ Any number whose webhook points at smsd is handled; there is no list of numbers 
 All `/api` calls need `Authorization: Bearer $APP_TOKEN`. A conversation is between one of your numbers and a peer, and both are in the path. Each can be an E.164 number (`+16135551234` or `%2B16135551234`), a short code, or an alphanumeric sender ID.
 
 ```sh
+# list the project's phone numbers, as SignalWire describes them
+curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/numbers
+
 # list conversations on all your numbers (newest first)
 curl -H "Authorization: Bearer $APP_TOKEN" $PUBLIC_URL/api/conversations
 

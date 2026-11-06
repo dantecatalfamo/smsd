@@ -100,6 +100,7 @@ func (s *server) routes() http.Handler {
 
 	// Client -> us (bearer-token auth)
 	api := http.NewServeMux()
+	api.HandleFunc("GET /api/numbers", s.handleNumbers)
 	api.HandleFunc("GET /api/conversations", s.handleConversations)
 	api.HandleFunc("GET /api/numbers/{number}/conversations", s.handleConversations)
 	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}", s.handleMessages)
@@ -318,6 +319,25 @@ func (s *server) requireToken(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleNumbers passes through SignalWire's list of the project's phone numbers.
+func (s *server) handleNumbers(w http.ResponseWriter, r *http.Request) {
+	nums, err := s.sw.PhoneNumbers(r.Context())
+	if err != nil {
+		log.Printf("list phone numbers: %v", err)
+		if apiErr, ok := errors.AsType[*apiError](err); ok {
+			writeJSON(w, http.StatusBadGateway, errBody(apiErr.Message))
+			return
+		}
+		if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+			writeJSON(w, http.StatusGatewayTimeout, errBody("no response from SignalWire"))
+			return
+		}
+		writeJSON(w, http.StatusBadGateway, errBody("listing numbers failed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, nums)
 }
 
 // handleConversations lists conversations on one number, or on all of them

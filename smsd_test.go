@@ -279,7 +279,7 @@ func TestSendListAndStatus(t *testing.T) {
 		u, p, _ := r.BasicAuth()
 		var req struct{ From, To, Body, Status_Callback string }
 		json.NewDecoder(r.Body).Decode(&req)
-		if r.URL.Path != "/messages" || u != "proj" || p != "tok" || req.To != "+16135551234" || req.From != "+16135550000" ||
+		if r.URL.Path != "/messaging/messages" || u != "proj" || p != "tok" || req.To != "+16135551234" || req.From != "+16135550000" ||
 			req.Body != "hello back" || req.Status_Callback != "https://sms.example.com/webhook/status" {
 			http.Error(w, `{"errors":[{"detail":"bad request"}]}`, 422)
 			return
@@ -959,5 +959,51 @@ func TestMediaOutRejectsBadLinks(t *testing.T) {
 		if rec := fetchAsSignalWire(t, s, link); rec.Code != http.StatusForbidden {
 			t.Errorf("%s: got %d", name, rec.Code)
 		}
+	}
+}
+
+func TestListNumbersFollowsPages(t *testing.T) {
+	var queries []string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if u, p, _ := r.BasicAuth(); r.URL.Path != "/relay/rest/phone_numbers" || u != "proj" || p != "tok" {
+			http.Error(w, `{"errors":[{"detail":"bad request"}]}`, 401)
+			return
+		}
+		queries = append(queries, r.URL.RawQuery)
+		if r.URL.Query().Get("page_token") == "" {
+			// The next link points elsewhere; only its query may be used.
+			w.Write([]byte(`{"links":{"self":"x","first":"x","next":"https://evil.example/phone_numbers?page_number=1&page_size=1000&page_token=PA1"},
+				"data":[{"number":"+16135550000","name":"main","capabilities":["sms","mms"]}]}`))
+			return
+		}
+		w.Write([]byte(`{"links":{"self":"x","first":"x"},"data":[{"number":"+16135559999","name":null,"capabilities":["voice"]}]}`))
+	}))
+	defer fake.Close()
+	s := newTestServer(t, fake.URL)
+
+	rec := apiRequest(t, s, "GET", "/api/numbers", "")
+	var nums []struct {
+		Number       string
+		Capabilities []string
+	}
+	json.Unmarshal(rec.Body.Bytes(), &nums)
+	if rec.Code != 200 || len(nums) != 2 || nums[0].Number != "+16135550000" || nums[1].Number != "+16135559999" ||
+		len(nums[0].Capabilities) != 2 {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
+	}
+	if len(queries) != 2 || queries[0] != "page_size=1000" || !strings.Contains(queries[1], "page_token=PA1") {
+		t.Fatalf("queries: %q", queries)
+	}
+}
+
+func TestListNumbersReportsAPIError(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errors":[{"code":"forbidden","detail":"token lacks the Numbers scope"}]}`, 403)
+	}))
+	defer fake.Close()
+	s := newTestServer(t, fake.URL)
+	rec := apiRequest(t, s, "GET", "/api/numbers", "")
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "Numbers scope") {
+		t.Fatalf("got %d %s", rec.Code, rec.Body)
 	}
 }
