@@ -113,13 +113,14 @@ func (s *server) routes() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/numbers", s.handleNumbers)
 	api.HandleFunc("GET /api/conversations", s.handleConversations)
-	api.HandleFunc("POST /api/events/ticket", s.handleEventTicket)
-	api.HandleFunc("POST /api/numbers/{number}/events/ticket", s.handleEventTicket)
-	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/events/ticket", s.handleEventTicket)
 	api.HandleFunc("GET /api/numbers/{number}/conversations", s.handleConversations)
 	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}", s.handleMessages)
 	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/messages", s.handleSend)
 	api.HandleFunc("GET /api/media/{name}", s.handleMedia)
+	// Tickets for the event streams, which are mounted below.
+	api.HandleFunc("POST /api/events/ticket", s.handleEventTicket)
+	api.HandleFunc("POST /api/numbers/{number}/events/ticket", s.handleEventTicket)
+	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/events/ticket", s.handleEventTicket)
 
 	// Everything under these prefixes goes through the check, including paths
 	// with no route, so unauthenticated callers can't probe which routes exist.
@@ -129,9 +130,10 @@ func (s *server) routes() http.Handler {
 	mux.Handle("/api/", s.requireToken(api))
 	// Event streams take the token or a ticket, for browsers' EventSource,
 	// which can't send headers. These patterns are more specific than /api/.
-	for _, p := range eventStreamPatterns {
-		mux.Handle(p, s.eventAuth(http.HandlerFunc(s.handleEvents)))
-	}
+	events := s.eventAuth(http.HandlerFunc(s.handleEvents))
+	mux.Handle("GET /api/events", events)
+	mux.Handle("GET /api/numbers/{number}/events", events)
+	mux.Handle("GET /api/numbers/{number}/conversations/{peer}/events", events)
 	// SignalWire -> us, fetching outgoing attachments (signed, expiring links; checked in the handler)
 	mux.HandleFunc("GET /media-out/{name}", s.handleMediaOut)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })

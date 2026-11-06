@@ -107,12 +107,6 @@ var heartbeatInterval = 25 * time.Second // var for tests
 
 const replayPage = 500
 
-var eventStreamPatterns = []string{
-	"GET /api/events",
-	"GET /api/numbers/{number}/events",
-	"GET /api/numbers/{number}/conversations/{peer}/events",
-}
-
 // eventScope reads the stream's scope from the route: all messages, one of
 // our numbers, or one conversation. Empty means "all".
 func eventScope(w http.ResponseWriter, r *http.Request) (number, peer string, ok bool) {
