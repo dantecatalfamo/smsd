@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -104,6 +107,12 @@ var heartbeatInterval = 25 * time.Second // var for tests
 
 const replayPage = 500
 
+var eventStreamPatterns = []string{
+	"GET /api/events",
+	"GET /api/numbers/{number}/events",
+	"GET /api/numbers/{number}/conversations/{peer}/events",
+}
+
 // eventScope reads the stream's scope from the route: all messages, one of
 // our numbers, or one conversation. Empty means "all".
 func eventScope(w http.ResponseWriter, r *http.Request) (number, peer string, ok bool) {
@@ -117,7 +126,8 @@ func eventScope(w http.ResponseWriter, r *http.Request) (number, peer string, ok
 	return number, peer, true
 }
 
-// handleEvents streams events as server-sent events. With Last-Event-ID,
+// handleEvents streams events as server-sent events. With Last-Event-ID (or
+// ?last_event_id=, for a new EventSource, which can't set the header),
 // messages stored after that id are replayed first.
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	number, peer, ok := eventScope(w, r)
@@ -125,7 +135,11 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var last int64
-	if v := r.Header.Get("Last-Event-ID"); v != "" {
+	v := r.Header.Get("Last-Event-ID")
+	if v == "" {
+		v = r.URL.Query().Get("last_event_id")
+	}
+	if v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || id < 0 {
 			writeJSON(w, http.StatusBadRequest, errBody("Last-Event-ID must be a message id"))
@@ -216,4 +230,57 @@ func writeEvent(w io.Writer, kind string, m Message) error {
 	}
 	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, data)
 	return err
+}
+
+// --- tickets ----------------------------------------------------------------
+
+// ticketTTL is how long a ticket can be used to open a stream. It is checked
+// only when the stream opens; an open stream keeps running.
+var ticketTTL = 60 * time.Second // var for tests
+
+// handleEventTicket gives a bearer-token holder a short-lived ticket that
+// opens the matching event stream, as ?ticket=, without the token.
+func (s *server) handleEventTicket(w http.ResponseWriter, r *http.Request) {
+	number, peer, ok := eventScope(w, r)
+	if !ok {
+		return
+	}
+	exp := time.Now().Add(ticketTTL).Unix()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ticket":     fmt.Sprintf("%d.%s", exp, s.ticketMAC(exp, number, peer)),
+		"expires_at": time.Unix(exp, 0).UTC(),
+	})
+}
+
+// ticketMAC signs a ticket's expiry and the one stream it opens.
+func (s *server) ticketMAC(exp int64, number, peer string) string {
+	mac := hmac.New(sha256.New, s.eventKey)
+	fmt.Fprintf(mac, "%d\x00%s\x00%s", exp, number, peer)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *server) validTicket(ticket, number, peer string, now time.Time) bool {
+	expStr, sig, ok := strings.Cut(ticket, ".")
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if !ok || err != nil || now.Unix() >= exp {
+		return false
+	}
+	return hmac.Equal([]byte(sig), []byte(s.ticketMAC(exp, number, peer)))
+}
+
+// eventAuth accepts the bearer token, or, when there is no Authorization
+// header, a ticket for this exact stream.
+func (s *server) eventAuth(next http.Handler) http.Handler {
+	bearer := s.requireToken(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" || !r.URL.Query().Has("ticket") {
+			bearer.ServeHTTP(w, r)
+			return
+		}
+		if !s.validTicket(r.URL.Query().Get("ticket"), r.PathValue("number"), r.PathValue("peer"), time.Now()) {
+			writeJSON(w, http.StatusUnauthorized, errBody("invalid or expired ticket"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

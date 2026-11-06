@@ -48,6 +48,7 @@ type server struct {
 	notifier Notifier
 	events   *broker
 	mediaKey []byte // signs /media-out/ links
+	eventKey []byte // signs event stream tickets
 
 	// Background work (notifier calls, media downloads) runs under ctx, which
 	// stop cancels. mu makes "check ctx, then wg.Add" atomic with stop, so no
@@ -60,10 +61,17 @@ type server struct {
 
 func newServer(cfg config, store *Store, sw *signalWire, notifier Notifier) *server {
 	ctx, cancel := context.WithCancel(context.Background())
-	// Derived from APP_TOKEN so links stay valid across restarts; rotating the token revokes them.
-	mac := hmac.New(sha256.New, []byte(cfg.AppToken))
-	mac.Write([]byte("smsd media-out v1"))
-	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, events: newBroker(), mediaKey: mac.Sum(nil), ctx: ctx, cancel: cancel}
+	return &server{cfg: cfg, store: store, sw: sw, notifier: notifier, events: newBroker(),
+		mediaKey: deriveKey(cfg.AppToken, "smsd media-out v1"), eventKey: deriveKey(cfg.AppToken, "smsd event ticket v1"),
+		ctx: ctx, cancel: cancel}
+}
+
+// deriveKey makes a signing key from APP_TOKEN, so what it signs stays valid
+// across restarts and rotating the token revokes it.
+func deriveKey(appToken, label string) []byte {
+	mac := hmac.New(sha256.New, []byte(appToken))
+	mac.Write([]byte(label))
+	return mac.Sum(nil)
 }
 
 // background runs f in a goroutine unless the server is stopping. A panic is
@@ -105,9 +113,9 @@ func (s *server) routes() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/numbers", s.handleNumbers)
 	api.HandleFunc("GET /api/conversations", s.handleConversations)
-	api.HandleFunc("GET /api/events", s.handleEvents)
-	api.HandleFunc("GET /api/numbers/{number}/events", s.handleEvents)
-	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}/events", s.handleEvents)
+	api.HandleFunc("POST /api/events/ticket", s.handleEventTicket)
+	api.HandleFunc("POST /api/numbers/{number}/events/ticket", s.handleEventTicket)
+	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/events/ticket", s.handleEventTicket)
 	api.HandleFunc("GET /api/numbers/{number}/conversations", s.handleConversations)
 	api.HandleFunc("GET /api/numbers/{number}/conversations/{peer}", s.handleMessages)
 	api.HandleFunc("POST /api/numbers/{number}/conversations/{peer}/messages", s.handleSend)
@@ -119,6 +127,11 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/", s.verifySignalWire(webhooks))
 	mux.Handle("/api/", s.requireToken(api))
+	// Event streams take the token or a ticket, for browsers' EventSource,
+	// which can't send headers. These patterns are more specific than /api/.
+	for _, p := range eventStreamPatterns {
+		mux.Handle(p, s.eventAuth(http.HandlerFunc(s.handleEvents)))
+	}
 	// SignalWire -> us, fetching outgoing attachments (signed, expiring links; checked in the handler)
 	mux.HandleFunc("GET /media-out/{name}", s.handleMediaOut)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })

@@ -98,7 +98,33 @@ Each event's data is a whole message, as the API returns it:
 - `message`: a new message, inbound or outbound. Its SSE `id` is the message's `id`.
 - `update`: a stored message changed, after a delivery status callback or an attachment finishing its download. Updates have no `id`.
 
-Reconnect with `Last-Event-ID` (EventSource clients do this themselves) to get the messages stored since that id before live events resume. Missed updates are not replayed, so refetch the conversation if you need current statuses. A stream that falls too far behind is closed, and catches up the same way when the client reconnects. A `: ping` comment every 25 seconds keeps idle connections open through proxies. Streams need the same bearer token as the rest of the API, so the browser's built-in `EventSource`, which can't send headers, won't work; use a fetch-based client.
+Reconnect with `Last-Event-ID` (EventSource clients do this themselves) to get the messages stored since that id before live events resume. Missed updates are not replayed, so refetch the conversation if you need current statuses. A stream that falls too far behind is closed, and catches up the same way when the client reconnects. A `: ping` comment every 25 seconds keeps idle connections open through proxies. Streams take the same bearer token as the rest of the API, or a ticket. The browser's `EventSource` can't send headers, so it uses a ticket instead.
+
+### Tickets
+
+`POST` to a stream's path plus `/ticket`, with the bearer token, to get a ticket for that one stream:
+
+```sh
+curl -X POST -H "Authorization: Bearer $APP_TOKEN" \
+  $PUBLIC_URL/api/numbers/%2B16135550000/conversations/%2B16135551234/events/ticket
+# {"ticket":"1793984400.9f2c...","expires_at":"2026-11-06T17:00:00Z"}
+```
+
+Then open the stream with `?ticket=`:
+
+```js
+const es = new EventSource(`${base}/api/numbers/%2B16135550000/conversations/%2B16135551234/events?ticket=${ticket}`);
+```
+
+A ticket opens only the stream it was issued for, and only within 60 seconds. It is checked when the stream opens, so an open stream keeps running after its ticket expires. A ticket is signed with a key derived from `APP_TOKEN`, so rotating the token invalidates outstanding tickets. A ticket can't be used for any other API call.
+
+When a stream drops, `EventSource` reconnects with the same URL, and once the ticket has expired that fails with 401 and `EventSource` gives up (`readyState` becomes `CLOSED`). Then get a new ticket and open a new `EventSource`, passing the last event id it saw as `?last_event_id=` (a new `EventSource` can't set the `Last-Event-ID` header):
+
+```js
+es.onerror = () => {
+  if (es.readyState === EventSource.CLOSED) reconnect(lastEventId); // new ticket, then ...&last_event_id=${lastEventId}
+};
+```
 
 ## Extending
 

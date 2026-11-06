@@ -27,7 +27,9 @@ func openStream(t *testing.T, s *server, path, lastID string) <-chan sse {
 	t.Cleanup(cancel)
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+path, nil)
-	req.Header.Set("Authorization", "Bearer secret")
+	if !strings.Contains(path, "ticket=") {
+		req.Header.Set("Authorization", "Bearer secret")
+	}
 	if lastID != "" {
 		req.Header.Set("Last-Event-ID", lastID)
 	}
@@ -283,5 +285,115 @@ func TestBrokerDropsSlowSubscriber(t *testing.T) {
 	b.close()
 	if b.subscribe("", "") != nil {
 		t.Fatal("subscribed after close")
+	}
+}
+
+func getTicket(t *testing.T, s *server, streamPath string) string {
+	t.Helper()
+	rec := apiRequest(t, s, "POST", streamPath+"/ticket", "")
+	var body struct {
+		Ticket    string    `json:"ticket"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &body)
+	if rec.Code != 200 || body.Ticket == "" || time.Until(body.ExpiresAt) <= 0 || time.Until(body.ExpiresAt) > ticketTTL {
+		t.Fatalf("ticket for %s: %d %s", streamPath, rec.Code, rec.Body)
+	}
+	return body.Ticket
+}
+
+// get makes an unauthenticated request, as a browser's EventSource would.
+func get(s *server, path string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+	return rec
+}
+
+func TestTicketOpensItsStream(t *testing.T) {
+	s := newTestServer(t, "")
+	const conv = "/api/numbers/%2B16135550000/conversations/%2B16135551234/events"
+	signedPost(t, s, "/webhook/sms", inbound("1", "+16135551234", us, "one"))
+	signedPost(t, s, "/webhook/sms", inbound("2", "+16135551234", us, "two"))
+	first := onlyMessageIDs(t, s)[0]
+
+	// A fresh EventSource can't send Last-Event-ID, so it resumes with ?last_event_id=.
+	ch := openStream(t, s, conv+"?ticket="+getTicket(t, s, conv)+"&last_event_id="+fmt.Sprint(first), "")
+	if _, m := nextEvent(t, ch); m.SignalWireID != "2" {
+		t.Fatalf("replay: %+v", m)
+	}
+	signedPost(t, s, "/webhook/sms", inbound("3", "+16135551234", us, "three"))
+	if _, m := nextEvent(t, ch); m.SignalWireID != "3" {
+		t.Fatalf("live: %+v", m)
+	}
+
+	all := openStream(t, s, "/api/events?ticket="+getTicket(t, s, "/api/events"), "")
+	signedPost(t, s, "/webhook/sms", inbound("4", "+16135559876", "+16135559999", "elsewhere"))
+	if _, m := nextEvent(t, all); m.SignalWireID != "4" {
+		t.Fatalf("all: %+v", m)
+	}
+}
+
+func onlyMessageIDs(t *testing.T, s *server) []int64 {
+	t.Helper()
+	msgs, err := s.store.MessagesAfter(t.Context(), "", "", 0, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+func TestTicketsRejected(t *testing.T) {
+	s := newTestServer(t, "")
+	const conv = "/api/numbers/%2B16135550000/conversations/%2B16135551234/events"
+	const onUs = "/api/numbers/%2B16135550000/events"
+	ticket := getTicket(t, s, conv)
+	exp, sig, _ := strings.Cut(ticket, ".")
+
+	past := time.Now().Add(-time.Second).Unix()
+	expired := fmt.Sprintf("%d.%s", past, s.ticketMAC(past, "+16135550000", "+16135551234"))
+	other := newTestServer(t, "")
+	other.eventKey = deriveKey("rotated", "smsd event ticket v1")
+
+	for name, path := range map[string]string{
+		"other conversation": "/api/numbers/%2B16135550000/conversations/%2B16135554321/events?ticket=" + ticket,
+		"wider scope":        onUs + "?ticket=" + ticket,
+		"all messages":       "/api/events?ticket=" + ticket,
+		"expired":            conv + "?ticket=" + expired,
+		"later expiry":       conv + "?ticket=" + fmt.Sprint(time.Now().Add(time.Hour).Unix()) + "." + sig,
+		"bad signature":      conv + "?ticket=" + exp + "." + strings.Repeat("0", len(sig)),
+		"no signature":       conv + "?ticket=" + exp,
+		"empty":              conv + "?ticket=",
+		"not a stream":       "/api/conversations?ticket=" + ticket,
+		"not a stream 2":     "/api/numbers/%2B16135550000/conversations/%2B16135551234?ticket=" + ticket,
+		"no ticket":          conv,
+	} {
+		if rec := get(s, path); rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: got %d %s", name, rec.Code, rec.Body)
+		}
+	}
+	if rec := get(other, conv+"?ticket="+ticket); rec.Code != http.StatusUnauthorized {
+		t.Errorf("after rotating APP_TOKEN: got %d", rec.Code)
+	}
+
+	// Minting a ticket needs the token.
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, httptest.NewRequest("POST", conv+"/ticket", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("ticket without token: got %d", rec.Code)
+	}
+	if rec := apiRequest(t, s, "POST", "/api/numbers/bad%20number/events/ticket", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("ticket for bad number: got %d", rec.Code)
+	}
+	// A wrong bearer token isn't rescued by a valid ticket.
+	req := httptest.NewRequest("GET", conv+"?ticket="+ticket, nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec = httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token with ticket: got %d", rec.Code)
 	}
 }
