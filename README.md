@@ -31,8 +31,32 @@ Environment:
 
 smsd checks these at startup and reports every missing or malformed one.
 
-In SignalWire, set **Message Handling** to a **SWML Webhook** on each number smsd should handle:
-`POST https://sms.example.com/webhook/sms`. smsd answers each inbound message with a SWML document that just `receive`s it.
+### Connecting SignalWire numbers
+
+Point each number smsd should handle at it with a messaging SWML script. You can create the script once and assign it to every number.
+
+1. In the SignalWire dashboard, open the phone number. Under **Inbound Message Settings** (not Inbound Call Settings), click **+ Assign Resource**.
+2. Choose **Script**, then **SWML Script**. For later numbers, pick the script you already created.
+3. Fill in **New SWML Script**:
+   - **Name:** anything, e.g. `smsd`.
+   - **Script Type:** **Messaging**. It defaults to Calling, and a calling script gets a different payload that smsd rejects.
+   - **Handle Calls Using:** the external URL option. The label still says "Calls" after switching to Messaging; that's a dashboard quirk.
+   - **Primary Script URL:** `PUBLIC_URL` + `/webhook/sms`, e.g. `https://sms.example.com/webhook/sms`.
+   - **Fallback Script URL** and **Status Change Webhook:** leave empty. smsd sets the delivery status callback on each message it sends.
+4. Click **Create**, then **Save** on the number's page.
+
+To confirm the script type saved as messaging:
+
+```sh
+curl -s -u "$SW_PROJECT_ID:$SW_API_TOKEN" "https://$SW_SPACE/api/fabric/resources/swml_webhooks"
+```
+
+Look for `"script_type": "messaging"` and your `/webhook/sms` URL. Then text the number. The log should show `POST "/webhook/sms" 200` and an `inbound ... from ... to ...` line. Troubleshooting:
+
+- `403` and `rejected webhook: bad signature`: the Primary Script URL doesn't exactly match `PUBLIC_URL` + `/webhook/sms` (scheme, host, port, path).
+- `400` `missing message_id`: the script was saved as Calling. Change its type to Messaging, or delete and recreate it.
+
+smsd answers each inbound message with a SWML document that just `receive`s it.
 
 Webhooks are verified with `X-SignalWire-Signature`, which is hex HMAC-SHA1 of the URL plus the raw JSON body. Don't put basic-auth credentials in the webhook URL: SignalWire includes them in what it signs, and `PUBLIC_URL` won't have them.
 
